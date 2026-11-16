@@ -1,0 +1,23 @@
+{
+  "2026": {
+    "source": "NSE circular NSE/CMTR/71775 (12 Dec 2025) plus the 15 Jan 2026 Maharashtra municipal-election closure; cross-checked against Angel One daily candles to 2026-11-09. Weekend holidays are omitted.",
+    "holidays": [
+      "2026-01-15", "2026-01-26", "2026-03-03", "2026-03-26",
+      "2026-03-31", "2026-04-03", "2026-04-14", "2026-05-01",
+      "2026-05-28", "2026-06-26", "2026-09-14", "2026-10-02",
+      "2026-10-20", "2026-11-10", "2026-11-24", "2026-12-25"
+    ],
+    "special_sessions": [
+      {
+        "date": "2026-02-01",
+        "kind": "regular_weekend_session",
+        "source": "NSE/CMTR/72349: Budget session uses normal hours."
+      },
+      {
+        "date": "2026-11-08",
+        "kind": "muhurat",
+        "source": "NSE/CMTR/76941: continuous trading starts 14:20; the last 15-minute broker candle starts 15:20 and contains the session's 15:30 close. Not a scheduled trading session for this bot."
+      }
+    ]
+  }
+}

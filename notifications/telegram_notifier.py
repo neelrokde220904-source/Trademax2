@@ -8,6 +8,7 @@ from typing import Any
 
 import pytz
 from loguru import logger
+from telegram.error import TelegramError
 
 from config.settings import settings
 
@@ -29,6 +30,8 @@ class TelegramNotifier:
     def __init__(self) -> None:
         self._bot = None
         self._enabled = bool(settings.telegram_bot_token and settings.telegram_chat_id)
+        self._delivery_status = "untested" if self._enabled else "not_configured"
+        self._last_delivery_at: str | None = None
         if not self._enabled:
             logger.warning("[Telegram] Bot token or chat ID missing — notifications disabled.")
 
@@ -39,12 +42,7 @@ class TelegramNotifier:
             self._bot = Bot(token=settings.telegram_bot_token)
         return self._bot
 
-    async def send_message(self, text: str, parse_mode: str = "HTML") -> bool:
-        """Send a message to the configured Telegram chat."""
-        if not self._enabled:
-            logger.debug("[Telegram] Disabled — would send: {}", text[:100])
-            return False
-
+    async def _deliver(self, text: str, parse_mode: str | None) -> tuple[bool, str | None]:
         try:
             bot = await self._get_bot()
             if bot:
@@ -53,10 +51,86 @@ class TelegramNotifier:
                     text=text,
                     parse_mode=parse_mode,
                 )
-                return True
-        except Exception as exc:
-            logger.error("[Telegram] Failed to send message: {}", exc)
-        return False
+                self._delivery_status = "delivered"
+                self._last_delivery_at = datetime.now(IST).isoformat()
+                return True, None
+        except TelegramError as exc:
+            self._delivery_status = type(exc).__name__
+            logger.error("[Telegram] Delivery failed ({})", type(exc).__name__)
+            return False, type(exc).__name__
+        return False, "no_bot"
+
+    async def send_message(
+        self, text: str, parse_mode: str = "HTML", *,
+        dedup_key: str | None = None, severity: str = "info",
+    ) -> bool:
+        """Store the alert in the outbox, then try to deliver it.
+
+        ``dedup_key`` suppresses an identical alert sent within 30 minutes.
+        """
+        from notifications import outbox
+
+        if not self._enabled:
+            logger.debug("[Telegram] Disabled — would send: {}", text[:100])
+            if severity == "critical":
+                outbox.enqueue(
+                    text, parse_mode=parse_mode, dedup_key=dedup_key,
+                    severity=severity, deliverable=False,
+                )
+            return False
+
+        row_id = outbox.enqueue(
+            text, parse_mode=parse_mode, dedup_key=dedup_key, severity=severity,
+        )
+        if row_id is None and dedup_key:
+            logger.debug("[Telegram] Duplicate alert suppressed: {}", dedup_key)
+            return False
+        delivered, error = await self._deliver(text, parse_mode)
+        outbox.record_attempt(row_id, delivered=delivered, error=error)
+        return delivered
+
+    async def retry_outbox(self) -> int:
+        """Re-send stored alerts that were not delivered; returns the number delivered."""
+        if not self._enabled:
+            return 0
+        from notifications import outbox
+
+        delivered_count = 0
+        for item in outbox.due_for_retry():
+            delivered, error = await self._deliver(item["text"], item["parse_mode"])
+            outbox.record_attempt(item["id"], delivered=delivered, error=error)
+            delivered_count += int(delivered)
+        return delivered_count
+
+    def get_status(self) -> dict[str, Any]:
+        return {
+            "configured": self._enabled, "delivery_status": self._delivery_status,
+            "last_delivery_at": self._last_delivery_at,
+        }
+
+    async def test_delivery(self) -> bool:
+        """Validate the recipient and send a real, non-sensitive test message."""
+        bot = await self._get_bot()
+        if bot is None:
+            return False
+        try:
+            me = await bot.get_me()
+            if settings.telegram_chat_id == str(me.id):
+                self._delivery_status = "recipient_is_bot"
+                logger.error("[Telegram] Recipient is the bot; configure a private chat or group")
+                return False
+            chat = await bot.get_chat(settings.telegram_chat_id)
+            if chat.type not in {"private", "group", "supergroup", "channel"}:
+                self._delivery_status = "unsupported_recipient"
+                return False
+            return await self.send_message(
+                "India AI Trader: Telegram delivery test. Paper mode only; "
+                "this message does not resume entries or clear a safety halt."
+            )
+        except TelegramError as exc:
+            self._delivery_status = type(exc).__name__
+            logger.error("[Telegram] Recipient validation failed ({})", type(exc).__name__)
+            return False
 
     # ----- TRADE NOTIFICATIONS -----
 
@@ -111,6 +185,8 @@ class TelegramNotifier:
     async def notify_daily_summary(self, summary: dict[str, Any]) -> None:
         """Send end-of-day summary."""
         pnl = summary.get("pnl", 0)
+        gross_pnl = summary.get("gross_pnl", pnl)
+        transaction_costs = summary.get("transaction_costs", 0)
         trades = summary.get("trades", 0)
         wins = summary.get("wins", 0)
         losses = summary.get("losses", 0)
@@ -122,7 +198,8 @@ class TelegramNotifier:
 
         msg = (
             f"{emoji} <b>Daily Summary</b> — {datetime.now(IST).strftime('%d %b %Y')}\n\n"
-            f"PnL: {sign}₹{pnl:,.2f}\n"
+            f"Net PnL: {sign}₹{pnl:,.2f}\n"
+            f"Gross PnL: ₹{gross_pnl:,.2f} | Est. costs: ₹{transaction_costs:,.2f}\n"
             f"Total Trades: {trades} (W:{wins} L:{losses})\n"
             f"Win Rate: {win_rate:.1f}%\n"
             f"Portfolio Value: ₹{portfolio_value:,.2f}\n"
@@ -146,19 +223,23 @@ class TelegramNotifier:
         )
         await self.send_message(msg)
 
-    async def notify_risk_alert(self, alert: str) -> None:
+    async def notify_risk_alert(
+        self, alert: str, *, dedup_key: str | None = None, severity: str = "warning",
+    ) -> None:
         """Send a risk alert."""
         msg = f"⚠️ <b>RISK ALERT</b>\n\n{alert}"
-        await self.send_message(msg)
+        await self.send_message(msg, dedup_key=dedup_key, severity=severity)
 
-    async def notify_error(self, error: str) -> None:
+    async def notify_error(
+        self, error: str, *, dedup_key: str | None = None, severity: str = "critical",
+    ) -> None:
         """Send a system error alert."""
         msg = (
             f"🚨 <b>System Error</b>\n\n"
             f"{error[:500]}\n"
             f"Time: {datetime.now(IST).strftime('%H:%M:%S')}"
         )
-        await self.send_message(msg)
+        await self.send_message(msg, dedup_key=dedup_key, severity=severity)
 
     # ----- COMMAND HANDLERS -----
 

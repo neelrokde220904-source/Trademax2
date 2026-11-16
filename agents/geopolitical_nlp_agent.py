@@ -19,11 +19,8 @@ from loguru import logger
 from agents.base_agent import TradingState
 from config.settings import settings
 
-try:
-    from anthropic import Anthropic
-    ANTHROPIC_AVAILABLE = True
-except ImportError:
-    ANTHROPIC_AVAILABLE = False
+from agents.llm_client import LLMClient, complete
+from config.llm_runtime import llm_operation
 
 
 # Supply chain knowledge graph — maps geopolitical events to market impacts
@@ -102,17 +99,11 @@ SUPPLY_CHAIN_KNOWLEDGE_GRAPH: dict[str, dict[str, Any]] = {
 }
 
 
-def _call_claude(model: str, prompt: str, max_tokens: int = 1500) -> str:
-    """Call Claude API."""
-    if not ANTHROPIC_AVAILABLE or not settings.anthropic_api_key:
+@llm_operation("geopolitical")
+def _call_llm(role: str, prompt: str, max_tokens: int = 1500) -> str:
+    if not LLMClient(role, "geopolitical"):
         return "{}"
-    client = Anthropic(api_key=settings.anthropic_api_key)
-    response = client.messages.create(
-        model=model,
-        max_tokens=max_tokens,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return response.content[0].text if response.content else "{}"
+    return complete(role, prompt, max_tokens, task="geopolitical")
 
 
 class GeopoliticalNLPAgent:
@@ -120,17 +111,16 @@ class GeopoliticalNLPAgent:
 
     def __init__(self) -> None:
         self.knowledge_graph = SUPPLY_CHAIN_KNOWLEDGE_GRAPH
-        self.fast_model = settings.llm_fast_model
+        self.fast_model = "fast"
 
+    @llm_operation("geopolitical")
     def run(self, state: TradingState) -> dict[str, Any]:
         """Analyze geopolitical risks affecting the watchlist."""
         logs: list[str] = []
         errors: list[str] = []
         geo_risks: dict[str, Any] = {}
 
-        # Get news from sentiment agent's fetched articles
-        sentiment_data = state.get("sentiment_signals", {})
-        news_articles = sentiment_data.get("articles", [])
+        news_articles = state.get("news_snapshot", {}).get("articles", [])
 
         # Also check for active macro events from Kafka
         active_event = state.get("active_macro_event")
@@ -212,7 +202,7 @@ Respond ONLY in JSON:
     "market_outlook": "brief outlook"
 }}"""
 
-        response = _call_claude(self.fast_model, prompt)
+        response = _call_llm(self.fast_model, prompt)
         try:
             result = json.loads(response) if response.strip().startswith("{") else {}
             # Try extracting JSON from code block
@@ -261,12 +251,13 @@ Respond ONLY in JSON:
         """Fallback rule-based geopolitical check using market data."""
         risks = []
 
-        # Check crude oil impact via macro signals
-        macro = state.get("macro_signals", {})
-        crude_price = macro.get("crude_oil", {}).get("price", 0)
-        crude_change = macro.get("crude_oil", {}).get("change_pct", 0)
+        # macro_agent publishes {"overall": ..., "data": {"crude_oil": {...}, ...}}.
+        macro = state.get("macro_signals")
+        macro_data = macro.get("data") if isinstance(macro, dict) else None
+        crude = macro_data.get("crude_oil") if isinstance(macro_data, dict) else None
+        crude_change = crude.get("change_pct") if isinstance(crude, dict) else None
 
-        if crude_change > 3.0:
+        if isinstance(crude_change, (int, float)) and not isinstance(crude_change, bool) and crude_change > 3.0:
             risks.append({
                 "category": "crude_oil_price_increase",
                 "description": f"Crude oil up {crude_change:.1f}% — potential pressure on OMCs and aviation",
@@ -275,16 +266,8 @@ Respond ONLY in JSON:
                 "affected_watchlist_stocks": ["RELIANCE", "BPCL", "IOC"],
             })
 
-        # Check USD/INR stress
-        usd_inr_change = macro.get("usd_inr", {}).get("change_pct", 0)
-        if usd_inr_change > 0.5:  # INR weakening > 0.5%
-            risks.append({
-                "category": "currency_stress",
-                "description": f"INR weakening {usd_inr_change:.2f}% — import cost pressure",
-                "severity": "MEDIUM",
-                "time_horizon": "SHORT_TERM",
-                "affected_watchlist_stocks": [],
-            })
+        # The macro agent supplies no USD/INR change, so no currency rule is applied;
+        # a value is never fabricated.
 
         return {
             "identified_risks": risks,

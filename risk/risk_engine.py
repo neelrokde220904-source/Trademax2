@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import math
 from typing import Any
 
 import pytz
@@ -10,6 +11,7 @@ from loguru import logger
 
 from broker.portfolio_tracker import portfolio_tracker
 from config.settings import settings
+from data.nse_calendar import calendar_year_known, is_nse_holiday
 
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -76,8 +78,11 @@ class RiskEngine:
         return True, ""
 
     def _check_nse_holiday(self, signal: dict) -> tuple[bool, str]:
-        today = datetime.now(IST).strftime("%Y-%m-%d")
-        if today in settings.nse_holidays:
+        now = datetime.now(IST)
+        today = now.strftime("%Y-%m-%d")
+        if not calendar_year_known(now.year):
+            return False, f"NSE holiday calendar for {now.year} is not on file; entries blocked"
+        if is_nse_holiday(today):
             return False, f"NSE holiday: {today}"
         return True, ""
 
@@ -111,6 +116,8 @@ class RiskEngine:
         return True, ""
 
     def _check_vix(self, signal: dict) -> tuple[bool, str]:
+        if not math.isfinite(self._current_vix) or self._current_vix <= 0:
+            return False, "India VIX is unavailable or invalid"
         if self._current_vix > settings.vix_halt_threshold:
             return False, f"VIX {self._current_vix:.1f} > halt threshold {settings.vix_halt_threshold}"
         return True, ""

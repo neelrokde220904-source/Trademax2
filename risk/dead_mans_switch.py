@@ -11,8 +11,18 @@ import pytz
 from loguru import logger
 
 from config.settings import settings
+from operations.control_state import ControlStateStore, control_state
+from pydantic import BaseModel, ConfigDict, Field
 
 IST = pytz.timezone("Asia/Kolkata")
+
+
+class HaltState(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    halted: bool = Field(strict=True)
+    halt_reason: str
+    halt_time: datetime | None
+    failure_counts: dict[str, int]
 
 
 class DeadMansSwitch:
@@ -20,28 +30,42 @@ class DeadMansSwitch:
 
     Monitored components:
     - langgraph: pipeline execution failures
-    - anthropic_api: LLM call failures
+    - llm_provider: LLM call failures (formerly "anthropic_api", kept as an alias)
     - hmm_classifier: regime classification failures
     - broker_api: order placement / data fetch failures
     - websocket: tick feed disconnections
+    - protective_exits: scheduled stop/target/time-exit check failures
 
     Thresholds (consecutive failures to trigger halt):
     - langgraph: 3
-    - anthropic_api: 5
+    - llm_provider: 5
     - hmm_classifier: 3
     - broker_api: 3
     - websocket: 5
+    - protective_exits: 3
     """
 
     DEFAULT_THRESHOLDS: dict[str, int] = {
         "langgraph": 3,
-        "anthropic_api": 5,
+        "llm_provider": 5,
         "hmm_classifier": 3,
         "broker_api": 3,
         "websocket": 5,
+        "protective_exits": 3,
     }
 
-    def __init__(self, thresholds: dict[str, int] | None = None) -> None:
+    # Persisted state and callers may still use the old name.
+    COMPONENT_ALIASES: dict[str, str] = {"anthropic_api": "llm_provider"}
+
+    @classmethod
+    def canonical(cls, component: str) -> str:
+        return cls.COMPONENT_ALIASES.get(component, component)
+
+    def __init__(
+        self, thresholds: dict[str, int] | None = None,
+        store: ControlStateStore | None = None,
+    ) -> None:
+        self._store = store
         self._thresholds = thresholds or self.DEFAULT_THRESHOLDS
         self._consecutive_failures: dict[str, int] = defaultdict(int)
         self._halted = False
@@ -49,6 +73,29 @@ class DeadMansSwitch:
         self._halt_time: datetime | None = None
         self._failure_log: list[dict[str, Any]] = []
         self._notifier = None
+        saved = store.read("dead_man") if store else None
+        if saved is not None:
+            state = HaltState.model_validate(saved)
+            self._halted = state.halted
+            self._halt_reason = state.halt_reason
+            self._halt_time = state.halt_time
+            for name, count in state.failure_counts.items():
+                key = self.canonical(name)
+                self._consecutive_failures[key] = max(self._consecutive_failures[key], count)
+
+    def _persist(self) -> None:
+        if self._store:
+            try:
+                self._store.write("dead_man", HaltState(
+                    halted=self._halted, halt_reason=self._halt_reason,
+                    halt_time=self._halt_time,
+                    failure_counts=dict(self._consecutive_failures),
+                ).model_dump(mode="json"))
+            except Exception:
+                self._halted = True
+                self._halt_reason = "Operational state could not be persisted; manual recovery required"
+                logger.exception("[DMS] Could not persist safety state; failing closed")
+                raise
 
     @property
     def is_halted(self) -> bool:
@@ -60,11 +107,13 @@ class DeadMansSwitch:
 
     def record_success(self, component: str) -> None:
         """Reset consecutive failure counter for a component on success."""
+        component = self.canonical(component)
         if component in self._consecutive_failures:
             prev = self._consecutive_failures[component]
             if prev > 0:
                 logger.debug("[DMS] {} recovered after {} consecutive failures.", component, prev)
             self._consecutive_failures[component] = 0
+            self._persist()
 
     def record_failure(self, component: str, error: str = "") -> bool:
         """Record a failure for a component.
@@ -72,6 +121,7 @@ class DeadMansSwitch:
         Returns:
             True if this failure triggered a trading halt.
         """
+        component = self.canonical(component)
         self._consecutive_failures[component] += 1
         count = self._consecutive_failures[component]
         threshold = self._thresholds.get(component, 3)
@@ -97,6 +147,7 @@ class DeadMansSwitch:
             self._trigger_halt(component, count, error)
             return True
 
+        self._persist()
         return False
 
     def _trigger_halt(self, component: str, count: int, error: str) -> None:
@@ -108,7 +159,22 @@ class DeadMansSwitch:
             f"Last error: {error[:150]}"
         )
         logger.critical("[DMS] ⛔ TRADING HALTED — {}", self._halt_reason)
+        self._persist()
+        self._schedule_halt_alert()
 
+    def force_halt(self, reason: str) -> bool:
+        """Immediately halt trading after a critical safety operation fails."""
+        if self._halted:
+            return False
+        self._halted = True
+        self._halt_time = datetime.now(IST)
+        self._halt_reason = f"Critical safety halt: {reason[:200]}"
+        logger.critical("[DMS] ⛔ TRADING HALTED — {}", self._halt_reason)
+        self._persist()
+        self._schedule_halt_alert()
+        return True
+
+    def _schedule_halt_alert(self) -> None:
         # Fire-and-forget Telegram alert
         try:
             loop = asyncio.get_running_loop()
@@ -158,6 +224,7 @@ class DeadMansSwitch:
         self._halt_time = None
         # Reset all counters
         self._consecutive_failures.clear()
+        self._persist()
 
         # Fire-and-forget Telegram notification
         try:
@@ -208,4 +275,4 @@ class DeadMansSwitch:
 
 
 # Singleton
-dead_mans_switch = DeadMansSwitch()
+dead_mans_switch = DeadMansSwitch(store=control_state)

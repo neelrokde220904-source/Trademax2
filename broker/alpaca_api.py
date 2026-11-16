@@ -17,14 +17,14 @@ from config.settings import settings
 try:
     from alpaca.trading.client import TradingClient
     from alpaca.trading.requests import (
-        GetAssetsRequest,
+        GetOrdersRequest,
         LimitOrderRequest,
         MarketOrderRequest,
     )
-    from alpaca.trading.enums import AssetClass, OrderSide, OrderType, TimeInForce
+    from alpaca.trading.enums import OrderSide, QueryOrderStatus, TimeInForce
     from alpaca.data.historical.stock import StockHistoricalDataClient
     from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest
-    from alpaca.data.timeframe import TimeFrame
+    from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
     ALPACA_AVAILABLE = True
 except ImportError:
     ALPACA_AVAILABLE = False
@@ -121,6 +121,27 @@ class AlpacaClient:
             logger.error("Alpaca positions failed: {}", e)
             return []
 
+    def get_positions_strict(self) -> list[dict[str, Any]]:
+        """Fetch positions without converting an API failure into an empty book."""
+        if not self.trading_client:
+            raise RuntimeError("Alpaca trading client is not configured")
+        try:
+            positions = self.trading_client.get_all_positions()
+            return [
+                {
+                    "tradingsymbol": p.symbol,
+                    "quantity": float(p.qty),
+                    "average_price": float(p.avg_entry_price),
+                    "market_value": float(p.market_value),
+                    "ltp": float(p.current_price),
+                    "side": str(p.side),
+                }
+                for p in positions
+            ]
+        except Exception as exc:
+            logger.error("Alpaca strict position fetch failed: {}", type(exc).__name__)
+            raise RuntimeError("Alpaca positions unavailable") from exc
+
     def get_quote(self, symbol: str) -> dict[str, Any]:
         """Get latest quote for a symbol."""
         if not self.data_client:
@@ -142,6 +163,53 @@ class AlpacaClient:
         except Exception as e:
             logger.error("Alpaca quote failed for {}: {}", symbol, e)
             return {"error": str(e)}
+
+    def get_bars(
+        self, symbol: str, *, start: datetime, end: datetime, minutes: int = 15, limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        """Fetch IEX-only intraday bars; data failures propagate so callers fail closed."""
+        if not self.data_client:
+            raise RuntimeError("Alpaca historical data client is not configured")
+        try:
+            request = StockBarsRequest(
+                symbol_or_symbols=symbol,
+                timeframe=TimeFrame(minutes, TimeFrameUnit.Minute),
+                start=start,
+                end=end,
+                limit=limit,
+                feed="iex",
+            )
+            response = self.data_client.get_stock_bars(request)
+            return [
+                {"timestamp": bar.timestamp, "close": float(bar.close)}
+                for bar in response.data.get(symbol, [])
+            ]
+        except Exception as exc:
+            logger.error("Alpaca bars failed for {}: {}", symbol, type(exc).__name__)
+            raise RuntimeError(f"Alpaca bars unavailable for {symbol}") from exc
+
+    def get_open_orders(self) -> list[dict[str, Any]]:
+        """Fetch open Alpaca orders; callers must not treat an API failure as an empty list."""
+        if not self.trading_client:
+            raise RuntimeError("Alpaca trading client is not configured")
+        try:
+            orders = self.trading_client.get_orders(
+                filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500),
+            )
+            return [
+                {
+                    "id": str(order.id),
+                    "symbol": str(order.symbol).upper(),
+                    "side": str(order.side).lower().split(".")[-1],
+                    "quantity": float(order.qty or 0),
+                    "filled_quantity": float(order.filled_qty or 0),
+                    "limit_price": float(order.limit_price or 0),
+                }
+                for order in orders
+            ]
+        except Exception as exc:
+            logger.error("Alpaca open orders failed: {}", type(exc).__name__)
+            raise RuntimeError("Alpaca open orders unavailable") from exc
 
     def place_market_order(self, symbol: str, side: str, qty: float,
                            fractional: bool = False) -> AlpacaOrder:

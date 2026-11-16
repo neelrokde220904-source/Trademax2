@@ -10,9 +10,308 @@ from pathlib import Path
 # location before importing it.  This affects compilation cache only, not data.
 os.environ.setdefault("NUMBA_CACHE_DIR", str(Path(__file__).resolve().parents[1] / ".numba_cache"))
 
+import math
+
 import pandas as pd
 import pandas_ta as ta
 from loguru import logger
+
+from data.nse_calendar import expected_intraday_bar_starts
+
+IST = "Asia/Kolkata"
+
+
+def _reference_time(as_of: str | None) -> pd.Timestamp:
+    """Return the decision time as a naive IST timestamp (now unless replaying)."""
+    stamp = pd.Timestamp(as_of) if as_of else pd.Timestamp.now(tz=IST)
+    if stamp.tzinfo is None:
+        return stamp
+    return stamp.tz_convert(IST).tz_localize(None)
+
+
+def _completed_bars(df: pd.DataFrame, as_of: str | None, bar_minutes: int) -> pd.DataFrame:
+    """Return bars that had fully closed by the decision time, with naive IST times."""
+    stamps = pd.to_datetime(df["datetime"])
+    if stamps.isna().any() or bar_minutes <= 0:
+        raise ValueError("Intraday bars require valid timestamps and positive duration")
+    if stamps.dt.tz is not None:
+        stamps = stamps.dt.tz_convert(IST).dt.tz_localize(None)
+    bars = df.assign(datetime=stamps)
+    duplicate_rows = bars[bars["datetime"].duplicated(keep=False)]
+    if not duplicate_rows.empty:
+        values = duplicate_rows.groupby("datetime")[["open", "high", "low", "close", "volume"]]
+        if values.nunique(dropna=False).gt(1).any().any():
+            raise ValueError("Conflicting duplicate intraday bars")
+    bars = bars.drop_duplicates("datetime").sort_values("datetime", kind="stable")
+    closed = bars["datetime"] + pd.Timedelta(minutes=bar_minutes) <= _reference_time(as_of)
+    return bars[closed]
+
+
+def completed_intraday_bars(
+    df: pd.DataFrame, as_of: str | None = None, bar_minutes: int = 15
+) -> pd.DataFrame:
+    """Public completed-bar view used by signal generation and numeric filters."""
+    if "datetime" not in df.columns:
+        raise ValueError("Intraday OHLCV data requires a datetime column")
+    return _completed_bars(df, as_of, bar_minutes)
+
+
+def session_vwap(df: pd.DataFrame) -> pd.Series:
+    """Compute a session-anchored VWAP aligned to the input rows."""
+    if df.empty:
+        return pd.Series(index=df.index, dtype=float)
+    volume = pd.to_numeric(df["volume"], errors="coerce").clip(lower=0)
+    typical_price = (df["high"] + df["low"] + df["close"]) / 3
+    if "datetime" not in df.columns:
+        cumulative_volume = volume.cumsum()
+        return (typical_price * volume).cumsum().div(cumulative_volume.where(cumulative_volume > 0))
+    timestamps = pd.to_datetime(df["datetime"], errors="coerce")
+    if timestamps.dt.tz is not None:
+        timestamps = timestamps.dt.tz_convert(IST)
+    ordered = pd.DataFrame({
+        "row": range(len(df)),
+        "session": timestamps.dt.date.to_numpy(),
+        "timestamp": timestamps.to_numpy(),
+        "volume": volume.to_numpy(),
+        "turnover": (typical_price * volume).to_numpy(),
+    }).sort_values(["session", "timestamp", "row"], kind="stable")
+    cumulative_volume = ordered["volume"].groupby(ordered["session"], sort=False).cumsum()
+    cumulative_turnover = ordered["turnover"].groupby(ordered["session"], sort=False).cumsum()
+    ordered["vwap"] = cumulative_turnover.div(cumulative_volume.where(cumulative_volume > 0))
+    result = pd.Series(index=range(len(df)), dtype=float)
+    result.iloc[ordered["row"].to_numpy(dtype=int)] = ordered["vwap"].to_numpy()
+    result.index = df.index
+    return result
+
+
+def is_vwap_chop(
+    df: pd.DataFrame,
+    as_of: str | None = None,
+    *,
+    lookback_bars: int = 8,
+    band_pct: float = 0.005,
+    bar_minutes: int = 15,
+) -> bool:
+    """Detect an extended run of completed closes inside a narrow VWAP band."""
+    bars = _completed_bars(df, as_of, bar_minutes)
+    today = _reference_time(as_of).date()
+    current_session = bars[bars["datetime"].dt.date == today]
+    if len(current_session) < lookback_bars:
+        return False
+    vwap = session_vwap(current_session).tail(lookback_bars)
+    current_session = current_session.tail(lookback_bars)
+    valid = vwap.notna() & (vwap > 0)
+    if not valid.all():
+        return False
+    distance = (current_session["close"].reset_index(drop=True) - vwap.reset_index(drop=True)).abs()
+    return bool((distance / vwap.reset_index(drop=True) <= band_pct).all())
+
+
+def is_current_session_breakout(
+    df: pd.DataFrame,
+    as_of: str | None = None,
+    *,
+    lookback_bars: int = 20,
+    bar_minutes: int = 15,
+) -> bool:
+    """Identify a completed close beyond the prior lookback high or low."""
+    bars = _completed_bars(df, as_of, bar_minutes)
+    today = _reference_time(as_of).date()
+    if len(bars) < lookback_bars + 1 or bars.iloc[-1]["datetime"].date() != today:
+        return False
+    previous = bars.iloc[-lookback_bars - 1:-1]
+    latest = bars.iloc[-1]
+    return bool(
+        latest["close"] > previous["high"].max()
+        or latest["close"] < previous["low"].min()
+    )
+
+
+def average_daily_turnover_inr(
+    df: pd.DataFrame,
+    as_of: str | None = None,
+    *,
+    lookback_sessions: int = 20,
+    minimum_sessions: int = 10,
+    minimum_bars_per_session: int = 20,
+    bar_minutes: int = 15,
+) -> float | None:
+    """Estimate full-session traded value from complete prior sessions only."""
+    bars = _completed_bars(df, as_of, bar_minutes)
+    today = _reference_time(as_of).date()
+    prior = bars[bars["datetime"].dt.date < today].copy()
+    if prior.empty:
+        return None
+    close = pd.to_numeric(prior["close"], errors="coerce")
+    volume = pd.to_numeric(prior["volume"], errors="coerce").clip(lower=0)
+    typical = (
+        pd.to_numeric(prior["high"], errors="coerce")
+        + pd.to_numeric(prior["low"], errors="coerce")
+        + close
+    ) / 3
+    prior["turnover"] = typical * volume
+    grouped = prior.groupby(prior["datetime"].dt.date)
+    sessions = [
+        float(session["turnover"].sum())
+        for _, session in grouped
+        if len(session) >= minimum_bars_per_session
+        and session["turnover"].notna().all()
+    ][-lookback_sessions:]
+    if len(sessions) < minimum_sessions:
+        return None
+    average = sum(sessions) / len(sessions)
+    return average if math.isfinite(average) and average > 0 else None
+
+
+def best_quote_spread_pct(
+    quote: dict | None,
+    as_of: str | None = None,
+    *,
+    max_age_seconds: float = 30.0,
+) -> float | None:
+    """Return a fresh two-sided top-of-book spread as a fraction of mid-price."""
+    if not isinstance(quote, dict):
+        return None
+    try:
+        reference = _reference_time(as_of)
+        if pd.isna(reference) or not math.isfinite(max_age_seconds) or max_age_seconds < 0:
+            return None
+        for field in ("timestamp", "exchange_timestamp"):
+            stamp = pd.Timestamp(quote.get(field))
+            if pd.isna(stamp) or stamp.tzinfo is None:
+                return None
+            stamp = stamp.tz_convert(IST).tz_localize(None)
+            age_seconds = (reference - stamp).total_seconds()
+            if age_seconds < -2 or age_seconds > max_age_seconds:
+                return None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+    def level_price(levels: object) -> float | None:
+        if not isinstance(levels, list) or not levels or not isinstance(levels[0], dict):
+            return None
+        try:
+            price = float(levels[0].get("price"))
+        except (TypeError, ValueError):
+            return None
+        return price if math.isfinite(price) and price > 0 else None
+
+    bid = level_price(quote.get("best_bid"))
+    ask = level_price(quote.get("best_ask"))
+    if bid is None or ask is None or ask < bid:
+        return None
+    midpoint = (bid + ask) / 2
+    return (ask - bid) / midpoint
+
+
+def daily_atr(
+    df: pd.DataFrame, as_of: str | None = None, length: int = 14, bar_minutes: int = 15
+) -> float | None:
+    """ATR from complete prior regular sessions; reject missing or malformed recent bars."""
+    if df.empty or bar_minutes <= 0 or 375 % bar_minutes:
+        return None
+    bars = _completed_bars(df, as_of, bar_minutes)
+    today = _reference_time(as_of).date()
+    prior = bars[bars["datetime"].dt.date < today]
+    groups = list(prior.groupby(prior["datetime"].dt.date, sort=True))
+    usable = []
+    for day, session in groups:
+        try:
+            expected = expected_intraday_bar_starts(day, bar_minutes)
+        except ValueError as exc:
+            logger.warning("Daily ATR unavailable: {}", exc)
+            return None
+        prices = session[["open", "high", "low", "close"]].apply(pd.to_numeric, errors="coerce")
+        complete = (
+            pd.DatetimeIndex(session["datetime"]).equals(expected)
+            and prices.map(math.isfinite).all().all()
+            and (prices > 0).all().all()
+            and (prices["high"] >= prices[["open", "low", "close"]].max(axis=1)).all()
+            and (prices["low"] <= prices[["open", "high", "close"]].min(axis=1)).all()
+        )
+        if not complete:
+            if not usable:
+                continue
+            logger.warning("Daily ATR unavailable: incomplete or invalid prior session {}", day)
+            return None
+        usable.append(session)
+    if len(usable) < length + 1:
+        return None
+    valid_prior = pd.concat(usable)
+    sessions = valid_prior.groupby(valid_prior["datetime"].dt.date).agg(
+        high=("high", "max"), low=("low", "min"), close=("close", "last")
+    )
+    atr = ta.atr(sessions["high"], sessions["low"], sessions["close"], length=length)
+    value = float(atr.iloc[-1]) if atr is not None and len(atr) else math.nan
+    return value if math.isfinite(value) and value > 0 else None
+
+
+def session_relative_volume(
+    df: pd.DataFrame, as_of: str | None = None, lookback: int = 20, bar_minutes: int = 15
+) -> float | None:
+    """Compare completed regular-session volume over identical time slots."""
+    return _same_time_relative_volume(df, as_of, lookback, bar_minutes, False, 1)
+
+
+def bar_relative_volume(
+    df: pd.DataFrame, as_of: str | None = None, lookback: int = 20,
+    bar_minutes: int = 15, min_samples: int = 5,
+) -> float | None:
+    """Compare the latest completed bar with prior sessions' matching bars."""
+    return _same_time_relative_volume(df, as_of, lookback, bar_minutes, True, min_samples)
+
+
+def _same_time_relative_volume(
+    df: pd.DataFrame, as_of: str | None, lookback: int, bar_minutes: int,
+    latest_bar_only: bool, min_samples: int,
+) -> float | None:
+    if (
+        df.empty or bar_minutes <= 0 or 375 % bar_minutes or lookback <= 0
+        or min_samples <= 0 or min_samples > lookback
+    ):
+        return None
+    bars = _completed_bars(df, as_of, bar_minutes)
+    reference = _reference_time(as_of)
+    if pd.isna(reference):
+        return None
+    today = reference.date()
+    session_open = pd.Timestamp(today) + pd.Timedelta(hours=9, minutes=15)
+    count = min(
+        max(int((reference - session_open).total_seconds() // (bar_minutes * 60)), 0),
+        375 // bar_minutes,
+    )
+    if count == 0:
+        return None
+    dates = bars["datetime"].dt.date
+
+    def matching_volume(day, session):
+        start = pd.Timestamp(day) + pd.Timedelta(hours=9, minutes=15)
+        expected = pd.date_range(start, periods=count, freq=f"{bar_minutes}min")
+        window = session[
+            (session["datetime"] >= start)
+            & (session["datetime"] < start + pd.Timedelta(minutes=count * bar_minutes))
+        ]
+        if not pd.DatetimeIndex(window["datetime"]).equals(expected):
+            return None
+        volume = pd.to_numeric(window["volume"], errors="coerce")
+        if not volume.map(math.isfinite).all() or (volume < 0).any():
+            return None
+        return float(volume.iloc[-1] if latest_bar_only else volume.sum())
+
+    current_volume = matching_volume(today, bars[dates == today])
+    if current_volume is None:
+        return None
+    baseline = [
+        volume
+        for day, session in bars[dates < today].groupby(dates[dates < today])
+        if (volume := matching_volume(day, session)) is not None
+    ][-lookback:]
+    if len(baseline) < min_samples:
+        return None
+    average = sum(baseline) / len(baseline) if baseline else 0.0
+    if not math.isfinite(average) or average <= 0:
+        return None
+    return current_volume / average
 
 
 def compute_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -60,11 +359,7 @@ def compute_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if adx is not None:
         df = pd.concat([df, adx], axis=1)
 
-    # VWAP (intraday)
-    try:
-        df["vwap"] = ta.vwap(df["high"], df["low"], df["close"], df["volume"])
-    except Exception:
-        df["vwap"] = (df["high"] + df["low"] + df["close"]) / 3  # Simple approximation
+    df["vwap"] = session_vwap(df)
 
     # ATR (14)
     df["atr_14"] = ta.atr(df["high"], df["low"], df["close"], length=14)
@@ -171,12 +466,10 @@ def _compute_composite_signal(indicators: dict, close: float) -> tuple[str, int,
 
     rsi = indicators.get("rsi_14")
     if rsi is not None:
-        if rsi < 35:
-            bullish_count += 1
-            reasons.append(f"RSI oversold ({rsi})")
+        if rsi < 40:
+            reasons.append(f"RSI below trend-momentum zone ({rsi})")
         elif rsi > 70:
-            bearish_count += 1
-            reasons.append(f"RSI overbought ({rsi})")
+            reasons.append(f"RSI above trend-momentum zone ({rsi})")
 
     # VWAP
     vwap = indicators.get("vwap")

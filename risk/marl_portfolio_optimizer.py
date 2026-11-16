@@ -26,7 +26,7 @@ except ImportError:
     logger.warning("stable-baselines3 / gymnasium not installed. MARL optimizer will use HRP-only fallback.")
 
 
-class PortfolioAllocationEnv(gym.Env):
+class PortfolioAllocationEnv(gym.Env if RL_AVAILABLE else object):
     """Custom RL environment for portfolio allocation.
 
     Observation: [returns, volatility, momentum, regime_features] per asset
@@ -36,6 +36,8 @@ class PortfolioAllocationEnv(gym.Env):
 
     def __init__(self, price_data: np.ndarray, n_assets: int,
                  reward_type: str = "sortino", lookback: int = 60) -> None:
+        if not RL_AVAILABLE:
+            raise RuntimeError("RL training requires gymnasium and stable-baselines3")
         super().__init__()
         self.price_data = price_data
         self.n_assets = n_assets
@@ -382,12 +384,8 @@ class MARLPortfolioOptimizer:
                 if normalized[s] < max_single:
                     normalized[s] += per_uncapped
 
-        # Final normalize
-        total = sum(normalized.values())
-        if total > 0:
-            normalized = {s: w / total for s, w in normalized.items()}
-
-        return normalized
+        # Unallocated weight remains cash when too few assets can absorb the cap.
+        return {symbol: min(weight, max_single) for symbol, weight in normalized.items()}
 
 
 # Singleton

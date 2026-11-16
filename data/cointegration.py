@@ -28,7 +28,7 @@ NSE_PAIR_CANDIDATES: list[tuple[str, str]] = [
     ("WIPRO", "HCLTECH"),
     ("INFY", "HCLTECH"),
     # Auto
-    ("MARUTI", "TATAMOTORS"),
+    ("MARUTI", "TMPV"),  # TATAMOTORS renamed after the 2025 demerger
     # FMCG
     ("HINDUNILVR", "ITC"),
     # Metals

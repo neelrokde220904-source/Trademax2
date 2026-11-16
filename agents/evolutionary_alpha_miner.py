@@ -30,11 +30,8 @@ from config.settings import settings
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-try:
-    from anthropic import Anthropic
-    ANTHROPIC_AVAILABLE = True
-except ImportError:
-    ANTHROPIC_AVAILABLE = False
+from agents.llm_client import LLMClient, complete
+from config.llm_runtime import llm_operation
 
 
 # Safe operator library — prevents the LLM from inventing invalid functions
@@ -48,15 +45,11 @@ Available group operations: groupby(sector).transform()
 """
 
 
-def _call_claude(model: str, prompt: str, max_tokens: int = 2000) -> str:
-    if not ANTHROPIC_AVAILABLE or not settings.anthropic_api_key:
+@llm_operation("alpha_miner")
+def _call_llm(prompt: str, max_tokens: int = 2000, intent: str = "text") -> str:
+    if not LLMClient("fast", "alpha_miner"):
         return ""
-    client = Anthropic(api_key=settings.anthropic_api_key)
-    response = client.messages.create(
-        model=model, max_tokens=max_tokens,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return response.content[0].text if response.content else ""
+    return complete("fast", prompt, max_tokens, task="alpha_miner", intent=intent)
 
 
 class IdeaAgent:
@@ -83,7 +76,7 @@ Examples of good hypotheses:
 Output ONLY JSON:
 {{"hypothesis": "...", "rationale": "...", "expected_IC": 0.05, "lookback_days": 20}}"""
 
-        response = _call_claude("claude-haiku-4-5-20251001", prompt, max_tokens=500)
+        response = _call_llm(prompt, max_tokens=500, intent="object")
         try:
             start = response.find("{")
             end = response.rfind("}") + 1
@@ -115,7 +108,7 @@ Requirements:
 
 Output ONLY the raw Python code, no markdown, no explanation, no ```."""
 
-        code = _call_claude(settings.llm_fast_model, prompt, max_tokens=1500)
+        code = _call_llm(prompt, max_tokens=1500)
 
         # Strip markdown fences if present
         code = code.strip()
@@ -321,7 +314,7 @@ Apply ONE specific mutation to fix the primary failure:
 
 Output ONLY the mutated Python code, no markdown, no explanation."""
 
-        code = _call_claude(settings.llm_fast_model, prompt, max_tokens=1500)
+        code = _call_llm(prompt, max_tokens=1500)
         code = code.strip()
         if code.startswith("```"):
             lines = code.split("\n")
@@ -434,6 +427,7 @@ class EvolutionaryAlphaMiner:
         self.reflection_agent = ReflectionAgent()
         self.alpha_library = AlphaLibrary()
 
+    @llm_operation("alpha_miner")
     def run_overnight_cycle(self, price_data: dict[str, pd.DataFrame]) -> dict[str, Any]:
         """Run the complete ARL loop. Call this from the overnight scheduler."""
         results: dict[str, Any] = {

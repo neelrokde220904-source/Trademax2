@@ -25,10 +25,12 @@ class TradingState(TypedDict):
 
     # Market data (populated by market_data_agent)
     market_data: dict[str, Any]       # {symbol: DataFrame of OHLCV}
+    market_data_provenance: dict[str, dict[str, Any]]
     live_quotes: dict[str, Any]       # {symbol: {ltp, volume, oi, ...}}
     india_vix: float
     gift_nifty: float
     fii_dii_data: dict[str, Any]
+    news_snapshot: dict[str, Any]
 
     # Agent signals (populated by each analyst agent)
     technical_signals: dict[str, Any]
@@ -43,6 +45,7 @@ class TradingState(TypedDict):
     portfolio_value: float
     available_capital: float
     current_positions: dict[str, Any]
+    portfolio_snapshot_valid: bool
 
     # Final decisions (populated by portfolio_manager_agent)
     trading_decisions: list[dict[str, Any]]
@@ -55,6 +58,9 @@ class TradingState(TypedDict):
     errors: Annotated[list[str], operator.add]
 
     # ────────────── v2.0 additions ──────────────────────
+
+    # Quantitative screen evidence, carried through to the order router
+    screener_results: dict[str, Any]
 
     # HMM Regime (populated by hmm_regime node)
     hmm_regime: dict[str, Any]          # {regime, directive, confidence, ...}
@@ -70,7 +76,9 @@ class TradingState(TypedDict):
 
     # Bull/Bear Debate (populated by bull_bear_synthesis node)
     debate_results: dict[str, Any]      # {net_conviction, bull_score, bear_score, ...}
-
+    review_contract_results: dict[str, Any]
+    scan_started_monotonic: float | None  # time.monotonic() when the pipeline began
+    strategy_candidates: dict[str, Any]   # {symbol: candidate} from enabled strategy sleeves (empty by default)
     # MARL Portfolio Optimizer (populated by marl_optimizer node)
     optimal_allocations: dict[str, float]  # {symbol: target_weight}
 
@@ -92,6 +100,17 @@ class TradingState(TypedDict):
     # Episodic Reflection Heuristics
     reflection_heuristics: list[dict[str, Any]]
     similar_past_trades: dict[str, Any]
+    llm_profile: dict[str, Any]
+    execution_enabled: bool
+    five_minute_bars: dict[str, Any]
+    research_mode: bool
+    research_as_of: str
+    research_daily_loss_hit: bool
+    research_fundamental_inputs: dict[str, Any]
+    research_options_inputs: dict[str, Any]
+    research_macro_inputs: dict[str, Any]
+    research_india_inputs: dict[str, Any]
+    research_capture: dict[str, Any]
 
 
 def create_initial_state(watchlist: list[str] | None = None) -> TradingState:
@@ -102,10 +121,12 @@ def create_initial_state(watchlist: list[str] | None = None) -> TradingState:
         watchlist=watchlist or settings.default_watchlist,
         date=datetime.now(IST).strftime("%Y-%m-%d"),
         market_data={},
+        market_data_provenance={},
         live_quotes={},
         india_vix=0.0,
         gift_nifty=0.0,
         fii_dii_data={},
+        news_snapshot={},
         technical_signals={},
         fundamental_signals={},
         sentiment_signals={},
@@ -116,17 +137,21 @@ def create_initial_state(watchlist: list[str] | None = None) -> TradingState:
         portfolio_value=settings.initial_capital,
         available_capital=settings.initial_capital,
         current_positions={},
+        portfolio_snapshot_valid=False,
         trading_decisions=[],
         executed_orders=[],
         agent_logs=[],
         errors=[],
         # v2.0 defaults
+        screener_results={},
         hmm_regime={},
         ofi_signals={},
         active_macro_event={},
         geopolitical_risks={},
         debate_results={},
-        optimal_allocations={},
+        review_contract_results={},
+        scan_started_monotonic=None,
+        strategy_candidates={},
         portfolio_greeks={},
         global_quotes={},
         lrs_status={},
@@ -134,6 +159,17 @@ def create_initial_state(watchlist: list[str] | None = None) -> TradingState:
         broker_balances={},
         reflection_heuristics=[],
         similar_past_trades={},
+        llm_profile={},
+        execution_enabled=True,
+        five_minute_bars={},
+        research_mode=False,
+        research_as_of="",
+        research_daily_loss_hit=False,
+        research_fundamental_inputs={},
+        research_options_inputs={},
+        research_macro_inputs={},
+        research_india_inputs={},
+        research_capture={},
     )
 
 

@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-import json
+import math
 from typing import Any
-
-import numpy as np
-import pandas as pd
-from loguru import logger
 
 from agents.base_agent import BaseAgent, TradingState
 from config.settings import settings
+from risk.daily_portfolio_risk import (
+    RiskHistoryUnavailable, correlation_block_reason, daily_returns, historical_var,
+)
+from risk.position_sizer import position_sizer
 
 
 class RiskManagerAgent(BaseAgent):
@@ -39,14 +39,28 @@ class RiskManagerAgent(BaseAgent):
 
         # --- Global Risk Checks ---
         # Daily loss limit
-        from broker.portfolio_tracker import portfolio_tracker
-        if portfolio_tracker.has_hit_daily_loss_limit():
+        if state.get("research_mode"):
+            daily_loss_hit = state["research_daily_loss_hit"]
+        else:
+            from broker.portfolio_tracker import portfolio_tracker
+            daily_loss_hit = portfolio_tracker.has_hit_daily_loss_limit()
+        if daily_loss_hit:
             logs.append(self.log("⛔ DAILY LOSS LIMIT HIT — blocking all new trades."))
             return {
                 "risk_assessment": {"blocked": True, "reason": "Daily loss limit exceeded"},
                 "agent_logs": logs,
                 "errors": errors,
             }
+        if not state.get("research_mode"):
+            from broker.portfolio_tracker import portfolio_tracker
+            if portfolio_tracker.has_hit_portfolio_drawdown_limit():
+                reason = "Persistent portfolio drawdown limit reached"
+                logs.append(self.log("⛔ {} — blocking all new trades.", reason))
+                return {
+                    "risk_assessment": {"blocked": True, "reason": reason},
+                    "agent_logs": logs,
+                    "errors": errors,
+                }
 
         # Max positions
         if len(current_positions) >= settings.max_positions:
@@ -58,6 +72,13 @@ class RiskManagerAgent(BaseAgent):
             }
 
         # VIX check
+        if not isinstance(india_vix, (int, float)) or not math.isfinite(india_vix) or india_vix <= 0:
+            message = "India VIX is unavailable or invalid; new entries blocked"
+            logs.append(self.log(message))
+            return {
+                "risk_assessment": {"blocked": True, "reason": message},
+                "agent_logs": logs, "errors": [message],
+            }
         vix_factor = 1.0
         if india_vix > settings.vix_halt_threshold:
             logs.append(self.log("⛔ VIX ({:.1f}) > halt threshold ({}) — halting trades.", india_vix, settings.vix_halt_threshold))
@@ -70,20 +91,60 @@ class RiskManagerAgent(BaseAgent):
             vix_factor = 0.5
             logs.append(self.log("⚠️ VIX ({:.1f}) elevated — reducing position sizes by 50%.", india_vix))
 
+        if not state.get("research_mode") and state.get("portfolio_snapshot_valid") is not True:
+            message = "Portfolio synchronization or fresh position marks unavailable; new entries blocked"
+            logs.append(self.log(message))
+            return {
+                "risk_assessment": {"blocked": True, "reason": message},
+                "agent_logs": logs, "errors": [message],
+            }
+
+        regime_position_cap = None
+        portfolio_stop_budget = None
+        if not state.get("research_mode"):
+            from risk.hmm_regime_classifier import entry_regime_position_cap
+            from risk.portfolio_stop_risk import (
+                StopRiskUnavailable, open_stop_risk, remaining_stop_risk,
+            )
+            from risk.stop_loss_manager import stop_loss_manager
+            try:
+                regime_position_cap = entry_regime_position_cap(state.get("hmm_regime"))
+            except ValueError as exc:
+                message = f"HMM position limit unavailable; new entries blocked: {exc}"
+                return {
+                    "risk_assessment": {"blocked": True, "reason": message},
+                    "agent_logs": [self.log(message)], "errors": [message],
+                }
+            try:
+                portfolio_stop_budget = remaining_stop_risk(
+                    portfolio_value,
+                    open_stop_risk(current_positions, stop_loss_manager.snapshot()),
+                )
+            except StopRiskUnavailable as exc:
+                message = f"Portfolio stop risk unavailable; new entries blocked: {exc}"
+                return {
+                    "risk_assessment": {"blocked": True, "reason": message},
+                    "agent_logs": [self.log(message)], "errors": [message],
+                }
+
         # --- Per-Symbol Risk Assessment ---
         risk_assessment: dict[str, Any] = {"blocked": False}
 
-        # Merge all symbols that have any signal
-        all_symbols = set()
-        for sigs in [tech, fund, sent]:
-            all_symbols.update(sigs.keys())
+        # Only assess symbols that passed the upstream quantitative screener.
+        eligible_symbols = set(state.get("watchlist", []))
+        all_symbols = eligible_symbols.intersection(set(tech) | set(fund) | set(sent))
+        history_cache: dict[str, Any] = {}
+        as_of = state.get("research_as_of") if state.get("research_mode") else None
 
-        for symbol in all_symbols:
+        def returns_for(symbol: str):
+            if symbol not in history_cache:
+                history_cache[symbol] = daily_returns(market_data.get(symbol), as_of or None)
+            return history_cache[symbol]
+
+        for symbol in sorted(all_symbols):
             try:
                 # Collect signals
                 t_sig = tech.get(symbol, {})
-                f_sig = fund.get(symbol, {})
-                s_sig = sent.get(symbol, {})
 
                 # Skip if India-specific says AVOID
                 i_sig = india.get(symbol, {})
@@ -94,55 +155,132 @@ class RiskManagerAgent(BaseAgent):
                     }
                     continue
 
-                # Only evaluate symbols with actionable signals
-                action_signals = [
-                    s for s in [t_sig.get("signal"), f_sig.get("signal"), s_sig.get("signal")]
-                    if s and s not in ("HOLD", None)
-                ]
-                if not action_signals:
+                # The deterministic technical signal is the entry gate; other agents
+                # may corroborate it but cannot create a trade direction.
+                technical_signal = str(t_sig.get("signal", "")).upper()
+                if technical_signal in {"BUY", "STRONG_BUY"}:
+                    action = "BUY"
+                elif technical_signal in {"SELL", "STRONG_SELL"}:
+                    action = "SELL"
+                else:
+                    risk_assessment[symbol] = {
+                        "approved": False,
+                        "rejection_reason": "No deterministic technical entry signal",
+                    }
                     continue
 
-                # Position sizing (Kelly-based)
-                max_position_value = self._kelly_position_size(
-                    available_capital, vix_factor
-                )
+                if not state.get("research_mode"):
+                    from risk.hmm_regime_classifier import entry_regime_strategy_block_reason
+                    strategy_reason = entry_regime_strategy_block_reason(
+                        state.get("hmm_regime"), t_sig.get("strategy"),
+                    )
+                    if strategy_reason:
+                        risk_assessment[symbol] = {
+                            "approved": False, "rejection_reason": strategy_reason,
+                        }
+                        logs.append(self.log("{}: REJECTED — {}", symbol, strategy_reason))
+                        continue
 
-                # VaR calculation
-                df = market_data.get(symbol, pd.DataFrame())
-                var_1day = self._calculate_var(df) if not df.empty else 0.02
+                try:
+                    candidate_returns = returns_for(symbol)
+                    var_1day = historical_var(candidate_returns, action)
+                    correlation_reason = correlation_block_reason(
+                        symbol, action, current_positions, returns_for,
+                    )
+                except RiskHistoryUnavailable as exc:
+                    reason = f"Daily risk history unavailable: {exc}"
+                    risk_assessment[symbol] = {"approved": False, "rejection_reason": reason}
+                    logs.append(self.log("{}: REJECTED — {}", symbol, reason))
+                    continue
+
+                sector_classification: dict[str, str] | None = None
+                if not state.get("research_mode"):
+                    from risk.sector_exposure import (
+                        SectorMetadataUnavailable, validate_candidate_sector,
+                    )
+
+                    try:
+                        sector_inputs = state.get("research_fundamental_inputs")
+                        sector_classification = validate_candidate_sector(
+                            symbol,
+                            sector_inputs.get(symbol) if isinstance(sector_inputs, dict) else None,
+                        )
+                    except (SectorMetadataUnavailable, TypeError, ValueError) as exc:
+                        reason = f"Sector classification unavailable: {exc}"
+                        risk_assessment[symbol] = {
+                            "approved": False, "rejection_reason": reason,
+                        }
+                        logs.append(self.log("{}: REJECTED — {}", symbol, reason))
+                        continue
 
                 # Check VaR limit
-                if var_1day > 0.02:
+                if var_1day > settings.max_portfolio_var_pct:
                     risk_assessment[symbol] = {
                         "approved": False,
-                        "rejection_reason": f"VaR too high: {var_1day:.4f} (limit: 2%)",
+                        "rejection_reason": (
+                            f"VaR too high: {var_1day:.4f} "
+                            f"(limit: {settings.max_portfolio_var_pct:.2%})"
+                        ),
                         "var_1day": var_1day,
                     }
-                    logs.append(self.log("{}: REJECTED — VaR {:.2%} > 2%", symbol, var_1day))
+                    logs.append(self.log(
+                        "{}: REJECTED — VaR {:.2%} > {:.2%}",
+                        symbol, var_1day, settings.max_portfolio_var_pct,
+                    ))
                     continue
 
-                # Correlation check with existing positions
-                if self._is_too_correlated(symbol, current_positions, market_data):
+                if correlation_reason:
                     risk_assessment[symbol] = {
                         "approved": False,
-                        "rejection_reason": "Too correlated with existing position (>0.8)",
+                        "rejection_reason": correlation_reason,
                     }
                     logs.append(self.log("{}: REJECTED — high correlation", symbol))
                     continue
 
-                # Stop-loss from technical signal
+                # Use deterministic technical levels; missing ATR-derived levels fail closed.
                 stop_loss = t_sig.get("stop_loss", 0)
                 target = t_sig.get("target", 0)
                 close = t_sig.get("indicators", {}).get("close", 0)
-                atr = t_sig.get("indicators", {}).get("atr_14", 0)
+                quote_price = (state.get("live_quotes", {}).get(symbol) or {}).get("ltp", 0)
+                if not close and quote_price:
+                    close = quote_price
 
-                if not stop_loss and close and atr:
-                    stop_loss = round(close - settings.stop_loss_atr_multiplier * atr, 2)
+                if not stop_loss or not target:
+                    risk_assessment[symbol] = {
+                        "approved": False,
+                        "rejection_reason": "Daily-ATR stop/target unavailable",
+                    }
+                    logs.append(self.log("{}: REJECTED — daily-ATR stop/target unavailable", symbol))
+                    continue
 
-                # Calculate max quantity
-                max_qty = 0
-                if close and close > 0:
-                    max_qty = int(max_position_value / close)
+                exposure_by_symbol = position_sizer.exposure_by_symbol(current_positions)
+                current_exposure = sum(exposure_by_symbol.values())
+                current_symbol_exposure = exposure_by_symbol.get(symbol, 0.0)
+                max_qty, sizing_reason = position_sizer.size(
+                    {
+                        "symbol": symbol,
+                        "action": action,
+                        "price": close,
+                        "stop_loss": stop_loss,
+                        "target": target,
+                        "holding_period": "INTRADAY",
+                    },
+                    portfolio_value=portfolio_value,
+                    available_capital=available_capital,
+                    current_exposure=current_exposure,
+                    current_symbol_exposure=current_symbol_exposure,
+                    risk_multiplier=vix_factor,
+                    max_position_pct=regime_position_cap,
+                    remaining_stop_risk=portfolio_stop_budget,
+                )
+                if max_qty <= 0:
+                    risk_assessment[symbol] = {
+                        "approved": False,
+                        "rejection_reason": sizing_reason or "No safe position size",
+                    }
+                    logs.append(self.log("{}: REJECTED — {}", symbol, sizing_reason))
+                    continue
+                max_position_value = max_qty * float(close)
 
                 # Risk score (0-100, lower is better)
                 risk_score = self._compute_risk_score(var_1day, india_vix, len(current_positions))
@@ -153,10 +291,13 @@ class RiskManagerAgent(BaseAgent):
                     "max_position_value": round(max_position_value, 2),
                     "stop_loss": stop_loss,
                     "target": target,
+                    "deterministic_action": action,
+                    "holding_period": str(t_sig.get("holding_period", "INTRADAY")).upper(),
                     "risk_score": risk_score,
                     "var_1day": round(var_1day, 4),
                     "vix_factor": vix_factor,
                     "rejection_reason": None,
+                    **(sector_classification or {}),
                 }
 
                 logs.append(
@@ -174,74 +315,6 @@ class RiskManagerAgent(BaseAgent):
             "agent_logs": logs,
             "errors": errors,
         }
-
-    def _kelly_position_size(self, capital: float, vix_factor: float) -> float:
-        """Fractional Kelly position sizing (25% Kelly)."""
-        # Default assumptions — updated with actual track record over time
-        win_rate = 0.55
-        avg_win = 0.02  # 2% average win
-        avg_loss = 0.015  # 1.5% average loss
-        kelly_fraction = 0.25
-
-        if avg_loss == 0:
-            return capital * settings.max_capital_per_trade_pct * vix_factor
-
-        kelly = (win_rate / avg_loss) - ((1 - win_rate) / avg_win)
-        safe_kelly = kelly * kelly_fraction
-
-        max_position = capital * max(0, min(safe_kelly, settings.max_capital_per_trade_pct))
-        return max_position * vix_factor
-
-    def _calculate_var(self, df: pd.DataFrame, confidence: float = 0.95) -> float:
-        """Historical VaR at given confidence level."""
-        if df.empty or len(df) < 20:
-            return 0.02  # Conservative default
-
-        returns = df["close"].pct_change().dropna()
-        if returns.empty:
-            return 0.02
-
-        var = float(np.percentile(returns, (1 - confidence) * 100))
-        return abs(var)
-
-    def _is_too_correlated(
-        self,
-        symbol: str,
-        positions: dict[str, Any],
-        market_data: dict[str, Any],
-        threshold: float = 0.8,
-    ) -> bool:
-        """Check if symbol is too correlated with existing positions."""
-        if not positions:
-            return False
-
-        sym_df = market_data.get(symbol, pd.DataFrame())
-        if sym_df.empty or len(sym_df) < 20:
-            return False
-
-        sym_returns = sym_df["close"].pct_change().dropna()
-
-        for pos_symbol in positions:
-            pos_df = market_data.get(pos_symbol, pd.DataFrame())
-            if pos_df.empty or len(pos_df) < 20:
-                continue
-
-            pos_returns = pos_df["close"].pct_change().dropna()
-
-            # Align lengths
-            min_len = min(len(sym_returns), len(pos_returns))
-            if min_len < 10:
-                continue
-
-            corr = np.corrcoef(
-                sym_returns.values[-min_len:],
-                pos_returns.values[-min_len:],
-            )[0, 1]
-
-            if abs(corr) > threshold:
-                return True
-
-        return False
 
     def _compute_risk_score(self, var: float, vix: float, n_positions: int) -> int:
         """Compute a 0–100 risk score (lower = safer)."""

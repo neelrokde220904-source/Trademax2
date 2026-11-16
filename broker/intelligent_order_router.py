@@ -15,10 +15,12 @@ from typing import Any
 from loguru import logger
 
 from config.settings import settings
+from broker.base_broker import OrderSubmissionUncertainError
 
 
 class Broker(str, Enum):
     ANGEL_ONE = "angel_one"
+    ZERODHA = "zerodha"
     IBKR = "ibkr"
     ALPACA = "alpaca"
 
@@ -73,6 +75,7 @@ class IntelligentOrderRouter:
     # Broker cost estimates (bps)
     BROKER_COSTS = {
         Broker.ANGEL_ONE: {"commission": 2, "stt": 10, "spread": 5},
+        Broker.ZERODHA: {"commission": 2, "stt": 10, "spread": 5},
         Broker.IBKR: {"commission": 1, "spread": 2},
         Broker.ALPACA: {"commission": 0, "spread": 3},
     }
@@ -83,6 +86,7 @@ class IntelligentOrderRouter:
 
     def __init__(self) -> None:
         self._angel_client = None
+        self._zerodha_client = None
         self._ibkr_client = None
         self._alpaca_client = None
 
@@ -105,6 +109,14 @@ class IntelligentOrderRouter:
             except ImportError:
                 pass
         return self._ibkr_client
+
+    @property
+    def zerodha_client(self) -> Any:
+        if self._zerodha_client is None:
+            from broker.zerodha_client import zerodha_client
+
+            self._zerodha_client = zerodha_client
+        return self._zerodha_client
 
     @property
     def alpaca_client(self) -> Any:
@@ -155,7 +167,8 @@ class IntelligentOrderRouter:
     def execute_order(self, symbol: str, action: str, quantity: float,
                       price: float = 0, exchange: str = "",
                       currency: str = "INR",
-                      force_algo: AlgoType | None = None) -> ExecutionReport:
+                      force_algo: AlgoType | None = None,
+                      product_type: str = "INTRADAY") -> ExecutionReport:
         """Route + execute an order end-to-end."""
         start_time = time.time()
 
@@ -165,9 +178,9 @@ class IntelligentOrderRouter:
                      routing.algo.value, routing.reason)
 
         if routing.algo == AlgoType.MARKET or routing.slices <= 1:
-            report = self._execute_single(routing, action, quantity, price)
+            report = self._execute_single(routing, action, quantity, price, product_type)
         else:
-            report = self._execute_sliced(routing, action, quantity, price)
+            report = self._execute_sliced(routing, action, quantity, price, product_type)
 
         report.execution_time_ms = int((time.time() - start_time) * 1000)
         report.timestamp = datetime.utcnow().isoformat()
@@ -205,6 +218,10 @@ class IntelligentOrderRouter:
     def _select_broker(self, market: str, symbol: str,
                        quantity: float, price: float) -> Broker:
         if market == "INDIA":
+            if settings.trademax_broker_mode == "zerodha_only":
+                return Broker.ZERODHA
+            if settings.trademax_broker_mode == "dual_active_failover":
+                return Broker.ZERODHA if settings.trademax_primary_broker == "zerodha" else Broker.ANGEL_ONE
             return Broker.ANGEL_ONE
 
         # For US/Global, prefer IBKR for large orders, Alpaca for small/fractional
@@ -291,7 +308,8 @@ class IntelligentOrderRouter:
     # ─── Execution ──────────────────────────────────────
 
     def _execute_single(self, routing: RoutingDecision, action: str,
-                        quantity: float, price: float) -> ExecutionReport:
+                        quantity: float, price: float,
+                        product_type: str = "INTRADAY") -> ExecutionReport:
         """Execute a single order on the chosen broker."""
         report = ExecutionReport(
             symbol=routing.symbol,
@@ -302,20 +320,130 @@ class IntelligentOrderRouter:
         )
 
         try:
-            if routing.broker == Broker.ANGEL_ONE:
-                report = self._execute_angel(routing.symbol, action, quantity, price, report)
+            if settings.paper_trading and routing.broker in {Broker.ANGEL_ONE, Broker.ZERODHA}:
+                report.broker = "paper"
+                report = self._execute_angel(
+                    routing.symbol, action, quantity, price, report, product_type
+                )
+            elif (
+                settings.paper_trading and routing.broker == Broker.ALPACA
+                and settings.foreign_us_paper_enabled
+            ):
+                report = self._execute_alpaca_paper(routing.symbol, action, quantity, price, report)
+            elif settings.paper_trading:
+                report.status = "PAPER_UNSUPPORTED"
+                logger.warning(
+                    "Paper mode blocked {} execution through {}; no live broker call made.",
+                    routing.symbol, routing.broker.value,
+                )
+            elif routing.broker == Broker.ZERODHA:
+                report = self._execute_indian_adapter(
+                    routing, action, quantity, price, product_type
+                )
+            elif routing.broker == Broker.ANGEL_ONE and settings.trademax_broker_mode == "dual_active_failover":
+                report = self._execute_indian_adapter(
+                    routing, action, quantity, price, product_type
+                )
+            elif routing.broker == Broker.ANGEL_ONE:
+                report = self._execute_angel(
+                    routing.symbol, action, quantity, price, report, product_type
+                )
             elif routing.broker == Broker.IBKR:
                 report = self._execute_ibkr(routing.symbol, action, quantity, price, report)
             elif routing.broker == Broker.ALPACA:
                 report = self._execute_alpaca(routing.symbol, action, quantity, price, report)
         except Exception as e:
-            report.status = "ERROR"
-            logger.error("Execution failed: {}", e)
+            report.status = (
+                "SUBMISSION_UNCERTAIN" if isinstance(e, OrderSubmissionUncertainError) else "ERROR"
+            )
+            logger.error("Execution failed for {}: {}", routing.symbol, type(e).__name__)
 
         return report
 
+    def _execute_indian_adapter(
+        self, routing: RoutingDecision, action: str, quantity: float, price: float,
+        product_type: str = "INTRADAY",
+    ) -> ExecutionReport:
+        """Build broker-native payloads and use confirmed-rejection failover only."""
+        from broker.dual_broker_router import dual_broker_router
+
+        report = ExecutionReport(
+            symbol=routing.symbol, broker=routing.broker.value, algo=routing.algo.value,
+            action=action, requested_qty=quantity,
+        )
+        exchange = "NSE" if routing.symbol.upper().endswith(".NS") else "BSE" if routing.symbol.upper().endswith(".BO") else "NSE"
+        symbol = routing.symbol.upper().removesuffix(".NS").removesuffix(".BO")
+        order_type = "LIMIT" if price > 0 else "MARKET"
+        angel_product = "INTRADAY" if product_type.upper() == "INTRADAY" else "DELIVERY"
+        kite_product = "MIS" if angel_product == "INTRADAY" else "CNC"
+        angel_payload: dict[str, Any] | None = None
+
+        def angel_order() -> dict[str, Any]:
+            nonlocal angel_payload
+            if angel_payload is None:
+                from config.instruments import get_token
+
+                token = get_token(symbol, exchange)
+                if not token:
+                    raise RuntimeError(f"Angel One token not found for {symbol}")
+                angel_payload = {
+                    "variety": "NORMAL", "tradingsymbol": symbol, "symboltoken": token,
+                    "transactiontype": action.upper(), "exchange": exchange,
+                    "ordertype": order_type, "producttype": angel_product, "duration": "DAY",
+                    "price": str(price or 0), "quantity": str(int(quantity)),
+                }
+            return angel_payload
+
+        def kite_order() -> dict[str, Any]:
+            return {
+                "exchange": exchange, "tradingsymbol": symbol,
+                "transaction_type": action.upper(), "quantity": int(quantity),
+                "order_type": order_type, "product": kite_product, "validity": "DAY",
+                **({"price": price} if price > 0 else {}),
+            }
+
+        if settings.trademax_broker_mode == "dual_active_failover":
+            primary_is_kite = settings.trademax_primary_broker == "zerodha"
+            result = dual_broker_router.execute(
+                primary=self.zerodha_client if primary_is_kite else self.angel_client,
+                secondary=self.angel_client if primary_is_kite else self.zerodha_client,
+                primary_order=kite_order if primary_is_kite else angel_order,
+                secondary_order=angel_order if primary_is_kite else kite_order,
+            )
+            routed_primary = result.get("routed_broker") != "secondary"
+            report.broker = (
+                "zerodha" if routed_primary == primary_is_kite else "angel_one"
+            )
+        elif routing.broker == Broker.ZERODHA:
+            result = self.zerodha_client.place_order(kite_order())
+        else:
+            result = self.angel_client.place_order(angel_order())
+
+        data = result.get("data") if isinstance(result, dict) else None
+        if not isinstance(data, dict):
+            data = {}
+        report.order_id = str(result.get("order_id") or data.get("orderid") or "")
+        status = str(result.get("status") or data.get("status") or "PENDING").upper()
+        report.status = status if status not in {"TRUE", "SUCCESS"} else "PENDING"
+        report.filled_qty = float(result.get("filled_quantity", data.get("filledshares", 0)) or 0)
+        report.avg_price = float(result.get("average_price", data.get("averageprice", 0)) or 0)
+        report.broker = str(result.get("broker") or report.broker)
+        from database.db import get_db
+        from database.models import Trade
+
+        with get_db() as database:
+            database.add(Trade(
+                symbol=symbol, exchange=exchange, action=action.upper(),
+                quantity=int(quantity), order_type=order_type, price=price,
+                holding_period=product_type.upper(), status="PENDING",
+                order_id=report.order_id or None, is_paper=False,
+                strategy="intelligent_router",
+            ))
+        return report
+
     def _execute_sliced(self, routing: RoutingDecision, action: str,
-                        quantity: float, price: float) -> ExecutionReport:
+                        quantity: float, price: float,
+                        product_type: str = "INTRADAY") -> ExecutionReport:
         """Execute order in multiple slices (VWAP/TWAP/IS)."""
         report = ExecutionReport(
             symbol=routing.symbol,
@@ -335,7 +463,19 @@ class IntelligentOrderRouter:
                 break
 
             current_slice = min(slice_qty, remaining)
-            slice_report = self._execute_single(routing, action, current_slice, price)
+            slice_report = self._execute_single(
+                routing, action, current_slice, price, product_type
+            )
+            if slice_report.status in {
+                "ERROR", "SUBMISSION_UNCERTAIN", "REJECTED", "BROKER_UNAVAILABLE",
+                "PAPER_UNSUPPORTED",
+            } or slice_report.status == "PENDING":
+                report.status = slice_report.status
+                report.order_id = slice_report.order_id
+                report.broker = slice_report.broker
+                report.filled_qty = total_filled
+                report.avg_price = total_cost / total_filled if total_filled else 0
+                return report
 
             if slice_report.filled_qty > 0:
                 total_filled += slice_report.filled_qty
@@ -358,7 +498,8 @@ class IntelligentOrderRouter:
         return report
 
     def _execute_angel(self, symbol: str, action: str, qty: float,
-                       price: float, report: ExecutionReport) -> ExecutionReport:
+                       price: float, report: ExecutionReport,
+                       product_type: str = "INTRADAY") -> ExecutionReport:
         """Execute via Angel One."""
         try:
             from broker.order_manager import OrderManager
@@ -369,11 +510,13 @@ class IntelligentOrderRouter:
                 quantity=int(qty),
                 price=price,
                 order_type="LIMIT" if price > 0 else "MARKET",
+                product_type=product_type,
             )
             report.order_id = result.get("order_id", "")
             report.status = result.get("status", "PENDING")
-            report.filled_qty = qty if report.status == "COMPLETE" else 0
-            report.avg_price = price
+            report.filled_qty = qty if report.status in {"COMPLETE", "EXECUTED", "FILLED"} else 0
+            report.avg_price = float(result.get("fill_price", result.get("avg_price", price)) or 0)
+            report.broker = "paper" if result.get("is_paper") else "angel_one"
         except Exception as e:
             report.status = "ERROR"
             logger.error("Angel execution error: {}", e)
@@ -395,6 +538,33 @@ class IntelligentOrderRouter:
         report.status = result.status
         report.filled_qty = result.filled
         report.avg_price = result.avg_fill_price
+        return report
+
+    def _execute_alpaca_paper(self, symbol: str, action: str, qty: float,
+                              price: float, report: ExecutionReport) -> ExecutionReport:
+        """US orders in paper mode go only through the paper-only adapter, and only when enabled."""
+        from broker.alpaca_paper_adapter import AlpacaPaperAdapter, AlpacaPaperRefused
+        from broker.base_broker import BrokerRejectedError
+
+        try:
+            adapter = AlpacaPaperAdapter(self.alpaca_client)
+            result = adapter.place_order({
+                "tradingsymbol": symbol, "transactiontype": action.upper(), "quantity": qty,
+                "price": price, "ordertype": "LIMIT",
+            })
+        except AlpacaPaperRefused as exc:
+            report.status = "PAPER_UNSUPPORTED"
+            logger.warning("US paper adapter refused {}: {}", symbol, exc)
+            return report
+        except BrokerRejectedError as exc:
+            report.status = "REJECTED"
+            logger.warning("US paper order for {} rejected: {}", symbol, exc)
+            return report
+        report.broker = "alpaca_paper"
+        report.order_id = result["orderid"]
+        report.status = str(result["status"])
+        report.filled_qty = result["filled_qty"]
+        report.avg_price = result["avg_price"]
         return report
 
     def _execute_alpaca(self, symbol: str, action: str, qty: float,

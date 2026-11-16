@@ -33,9 +33,17 @@ class IndiaSpecificAgent(BaseAgent):
         logs: list[str] = []
         errors: list[str] = []
         signals: dict[str, Any] = {}
+        captured = state.get("research_india_inputs", {})
+        replay = state.get("research_mode", False)
+        required = (
+            "fo_ban_list", "bulk_deals", "block_deals",
+            "promoter_pledging", "circuit_filters", "is_expiry_day",
+        )
+        if replay and any(name not in captured for name in required):
+            raise ValueError("Missing captured India-specific inputs for research replay")
 
         # --- F&O Ban List (critical — never trade banned stocks) ---
-        fo_ban_list = self._fetch_fo_ban_list()
+        fo_ban_list = captured["fo_ban_list"] if replay else self._fetch_fo_ban_list()
         signals["fo_ban_list"] = fo_ban_list
         if fo_ban_list:
             logs.append(self.log("F&O ban list: {}", fo_ban_list))
@@ -43,26 +51,28 @@ class IndiaSpecificAgent(BaseAgent):
             logs.append(self.log("No stocks in F&O ban today."))
 
         # --- Bulk Deals ---
-        bulk_deals = self._fetch_bulk_deals()
+        bulk_deals = captured["bulk_deals"] if replay else self._fetch_bulk_deals()
         signals["bulk_deals"] = bulk_deals
         if bulk_deals:
             logs.append(self.log("Found {} bulk deals.", len(bulk_deals)))
 
         # --- Block Deals ---
-        block_deals = self._fetch_block_deals()
+        block_deals = captured["block_deals"] if replay else self._fetch_block_deals()
         signals["block_deals"] = block_deals
 
         # --- Promoter Pledging (red flag) ---
-        pledging_data = self._check_promoter_pledging(state.get("watchlist", []))
+        pledging_data = captured["promoter_pledging"] if replay else self._check_promoter_pledging(state.get("watchlist", []))
         signals["promoter_pledging"] = pledging_data
 
         # --- Circuit Limits ---
-        circuit_data = self._check_circuit_limits(state.get("watchlist", []))
+        circuit_data = captured["circuit_filters"] if replay else self._check_circuit_limits(state.get("watchlist", []))
         signals["circuit_filters"] = circuit_data
 
         # --- Is today an F&O expiry? ---
-        is_expiry = self._is_expiry_day()
+        is_expiry = captured["is_expiry_day"] if replay else self._is_expiry_day()
         signals["is_expiry_day"] = is_expiry
+        if is_expiry is None:
+            signals["is_expiry_day_reason"] = "instrument master unavailable; expiry calendar unknown"
         if is_expiry:
             logs.append(self.log("⚠️ Today is F&O expiry — expect higher volatility."))
 
@@ -76,6 +86,7 @@ class IndiaSpecificAgent(BaseAgent):
 
         return {
             "india_signals": signals,
+            "research_india_inputs": {name: signals[name] for name in required},
             "agent_logs": logs,
             "errors": errors,
         }
@@ -170,10 +181,11 @@ class IndiaSpecificAgent(BaseAgent):
                             }
         return circuit_data
 
-    def _is_expiry_day(self) -> bool:
-        """Check if today is an F&O expiry day (Thursday for weeklies)."""
-        now = datetime.now(IST)
-        return now.weekday() == 3  # Thursday
+    def _is_expiry_day(self) -> bool | None:
+        """Whether a NIFTY option contract expires today; None if the contract master is unavailable."""
+        from data.instrument_master import is_fno_expiry_day
+
+        return is_fno_expiry_day("NIFTY")
 
     def _symbol_signal(self, symbol: str, signals: dict) -> dict[str, Any] | None:
         """Derive India-specific signal for a symbol."""

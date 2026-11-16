@@ -1,39 +1,159 @@
-import { useCallback, useEffect, useState } from "react";
-import { Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+import { useEffect, useState } from "react";
+import {
+  AlertTriangle, BrainCircuit, BriefcaseBusiness, CandlestickChart, CheckCircle2, FlaskConical, Globe, LayoutDashboard, Menu, ServerCog, ShieldCheck,
+  TrendingUp, X,
+} from "lucide-react";
 import "./dashboard.css";
+import { API, clientMarketSession, istDateTime, useApi, useHashView, useNow } from "./lib";
+import Overview from "./Overview";
+import Market from "./Market";
+import Portfolio from "./Portfolio";
+import Operations from "./OperationsPanel";
+import LLMControls from "./LLMControls";
+import Research from "./Research";
+import Workspaces from "./Workspaces";
 
-const API = "/api";
-const money = (n = 0) => `₹${new Intl.NumberFormat("en-IN", { maximumFractionDigits: 0 }).format(n)}`;
-const precise = (n = 0) => `₹${Number(n).toFixed(2)}`;
+const VIEWS = [
+  { id: "overview", label: "Overview", icon: LayoutDashboard },
+  { id: "workspaces", label: "Workspaces", icon: Globe },
+  { id: "market", label: "Market data", icon: CandlestickChart },
+  { id: "portfolio", label: "Portfolio", icon: BriefcaseBusiness },
+  { id: "operations", label: "Operations", icon: ServerCog },
+  { id: "ai", label: "AI model", icon: BrainCircuit },
+  { id: "research", label: "Research", icon: FlaskConical },
+];
 
-function useApi(path, delay) {
-  const [data, setData] = useState(null); const [error, setError] = useState(false);
-  const load = useCallback(async () => { try { const r = await fetch(`${API}${path}`); if (!r.ok) throw Error(); setData(await r.json()); setError(false); } catch { setError(true); } }, [path]);
-  useEffect(() => { load(); const id = setInterval(load, delay); return () => clearInterval(id); }, [load, delay]);
-  return { data, error };
+function Banner({ tone, icon: Icon, children, role = "status" }) {
+  return <div className={`banner tone-${tone}`} role={role}><Icon size={18} aria-hidden="true" /><span>{children}</span></div>;
 }
-function Panel({ title, children, note }) { return <section className="panel"><header><h2>{title}</h2>{note && <small>{note}</small>}</header>{children}</section>; }
-function Empty({ children }) { return <div className="empty">{children}</div>; }
-function Metric({ label, value, tone = "blue" }) { return <article className="metric"><small>{label}</small><strong className={tone}>{value}</strong></article>; }
-function Status({ label, value, good }) { return <div className="status"><span>{label}</span><b className={good ? "good" : "warn"}><i />{value}</b></div>; }
 
 export default function App() {
-  const portfolio = useApi("/portfolio", 5000), trades = useApi("/trades", 10000), signals = useApi("/signals", 10000), equity = useApi("/equity-curve", 30000), pnl = useApi("/pnl/daily", 30000), agents = useApi("/agents/status", 15000), health = useApi("/health", 5000);
+  const health = useApi("/health", 5000), operations = useApi("/operations", 5000);
+  const portfolio = useApi("/portfolio", 5000), trades = useApi("/trades", 10000), signals = useApi("/signals", 10000);
+  const equity = useApi("/equity-curve", 30000), pnl = useApi("/pnl/daily", 30000), agents = useApi("/agents/status", 15000);
+  const config = useApi("/config", 60000), watchlist = useApi("/market/watchlist", 10000);
   const [live, setLive] = useState(null), [busy, setBusy] = useState(false), [connected, setConnected] = useState(false);
-  useEffect(() => { const e = new EventSource(`${API}/stream`); e.onopen = () => setConnected(true); e.onerror = () => setConnected(false); e.onmessage = ({ data }) => { try { const event = JSON.parse(data); if (event.type === "system_status") setLive(event.data); } catch {} }; return () => e.close(); }, []);
-  const state = live || health.data, p = portfolio.data, daily = p?.daily_pnl || 0, failed = [portfolio,trades,signals,equity,pnl,agents,health].some(x => x.error);
-  const control = async action => { setBusy(true); try { const r = await fetch(`${API}/control`, {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action})}); const body = await r.json(); setLive(body.system); } finally { setBusy(false); } };
-  return <main className="app">
-    <header className="top"><div><small className="eyebrow">AUTONOMOUS EXECUTION CONSOLE</small><h1>India AI Trader</h1></div><div className="badges"><span className={connected ? "connected" : "disconnected"}><i />{connected ? "LIVE FEED" : "POLLING"}</span><span className={state?.paper_trading ? "paper" : "live"}>{state?.mode || "CHECKING"}</span></div></header>
-    {failed && <div className="notice">Some dashboard data is unavailable. Requests will retry automatically.</div>}
-    {state?.dead_mans_switch?.halted && <div className="notice danger">Circuit breaker active: {state.dead_mans_switch.halt_reason}</div>}
-    <section className="metrics"><Metric label="Portfolio value" value={money(p?.total_value)}/><Metric label="Today’s P&L" value={`${daily >= 0 ? "+" : ""}${money(daily)}`} tone={daily >= 0 ? "green" : "red"}/><Metric label="Available capital" value={money(p?.available_capital)} tone="purple"/><Metric label="Open positions" value={p?.position_count || 0} tone="white"/></section>
-    <section className="grid primary"><Panel title="Equity curve" note="Daily snapshots">{equity.data?.length ? <ResponsiveContainer width="100%" height={250}><AreaChart data={equity.data}><defs><linearGradient id="g" x1="0" x2="0" y1="0" y2="1"><stop stopColor="#7181ff" stopOpacity=".5"/><stop offset="1" stopColor="#7181ff" stopOpacity="0"/></linearGradient></defs><CartesianGrid vertical={false}/><XAxis dataKey="date"/><YAxis/><Tooltip formatter={money}/><Area dataKey="value" type="monotone" stroke="#8e9aff" fill="url(#g)"/></AreaChart></ResponsiveContainer> : <Empty>Curve appears after the first daily snapshot.</Empty>}</Panel><Panel title="System controls"><div className="statuses"><Status label="Scheduler" value={state?.scheduler_running ? "Running" : "Not started"} good={state?.scheduler_running}/><Status label="New entries" value={state?.trading_paused ? "Paused" : "Enabled"} good={!state?.trading_paused}/><Status label="Broker" value={state?.broker_authenticated ? "Authenticated" : state?.broker_configured ? "Configured" : "Paper fallback"} good={Boolean(state?.broker_authenticated || !state?.broker_configured)}/><Status label="Circuit breaker" value={state?.dead_mans_switch?.halted ? "HALTED" : "Clear"} good={!state?.dead_mans_switch?.halted}/></div><div className="buttons"><button disabled={busy || state?.trading_paused} onClick={() => control("pause")}>Pause new entries</button><button className="resume" disabled={busy || !state?.trading_paused} onClick={() => control("resume")}>Resume after review</button></div><p className="hint">Stops and time exits continue while entries are paused. Live mode cannot be changed here.</p></Panel></section>
-    <section className="grid thirds"><Panel title="Daily P&L">{pnl.data?.length ? <ResponsiveContainer width="100%" height={180}><BarChart data={pnl.data}><CartesianGrid vertical={false}/><XAxis dataKey="date"/><YAxis/><Tooltip formatter={precise}/><Bar dataKey="pnl">{pnl.data.map((x,i)=><Cell key={i} fill={x.pnl >= 0 ? "#27d5a2" : "#ff6e83"}/>)}</Bar></BarChart></ResponsiveContainer>:<Empty>Waiting for a market-close snapshot.</Empty>}</Panel><Panel title="Pipeline readiness"><div className="agents">{(agents.data || []).map(a=><span className={a.status} key={a.name}><i />{a.name.replace("Agent","")}</span>)}</div></Panel><Panel title="Latest execution">{trades.data?.[0] ? <div className="latest"><b className={trades.data[0].action === "BUY" ? "buy" : "sell"}>{trades.data[0].action}</b><strong>{trades.data[0].symbol}</strong><p>{trades.data[0].quantity} units at {precise(trades.data[0].price)}</p><small>{trades.data[0].status} · {trades.data[0].strategy || "Pipeline"}</small></div>:<Empty>No execution yet.</Empty>}</Panel></section>
-    <section className="grid tables"><Panel title="Open positions"><Positions rows={p?.positions || []}/></Panel><Panel title="Recent decisions"><Signals rows={signals.data || []}/></Panel></section><Panel title="Execution ledger"><Trades rows={trades.data || []}/></Panel>
-  </main>;
+  const [controlError, setControlError] = useState(""), [notice, setNotice] = useState(""), [reviewed, setReviewed] = useState(false);
+  const [view, go] = useHashView();
+  const [menuOpen, setMenuOpen] = useState(false);
+  const now = useNow(15000);
+
+  useEffect(() => {
+    const source = new EventSource(`${API}/stream`);
+    source.onopen = () => setConnected(true);
+    source.onerror = () => setConnected(false);
+    source.onmessage = ({ data }) => {
+      try { const event = JSON.parse(data); if (event.type === "system_status") setLive(event.data); } catch { /* ignore malformed event */ }
+    };
+    return () => source.close();
+  }, []);
+  useEffect(() => {
+    const label = VIEWS.find(item => item.id === view)?.label;
+    document.title = `${label} · India AI Trader`;
+  }, [view]);
+  useEffect(() => {
+    if (!menuOpen) return undefined;
+    const onKey = event => { if (event.key === "Escape") setMenuOpen(false); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [menuOpen]);
+  useEffect(() => {
+    if (!notice) return undefined;
+    const id = setTimeout(() => setNotice(""), 5000);
+    return () => clearTimeout(id);
+  }, [notice]);
+
+  const state = live && (!health.data || live.timestamp > health.data.timestamp) ? live : health.data;
+  const session = state?.market_session || clientMarketSession(now);
+  const ops = operations.data;
+  const failed = [portfolio, trades, signals, equity, pnl, agents, health, operations, config].some(item => item.error);
+
+  const mutate = async (path, body = {}) => {
+    setBusy(true); setControlError(""); setNotice("");
+    try {
+      const r = await fetch(`${API}${path}`, {
+        method: "POST", headers: { "Content-Type": "application/json", "X-Dashboard-Control": "1" },
+        body: JSON.stringify(body), signal: AbortSignal.timeout(30000),
+      });
+      const result = await r.json();
+      if (!r.ok) throw new Error(typeof result.detail === "string" ? result.detail : "Operation rejected.");
+      if (result.system) setLive(result.system);
+      setReviewed(false);
+      setNotice("Done — the server accepted the request. Status below is refreshed from the server.");
+      return result;
+    } catch (error) {
+      setControlError(error.name === "TimeoutError" ? "Request timed out. Refreshing saved state; do not assume success." : error.message);
+    } finally { setBusy(false); health.refresh(); operations.refresh(); }
+  };
+  const control = action => mutate("/control", { action, reviewed });
+  const choose = id => { go(id); setMenuOpen(false); };
+  const paper = state?.paper_trading;
+
+  return <div className="app">
+    <a className="skip-link" href="#main">Skip to content</a>
+    <header className="topbar">
+      <div className="topbar-inner">
+        <a className="brand" href="#overview" onClick={event => { event.preventDefault(); choose("overview"); }}>
+          <span className="brand-mark" aria-hidden="true"><TrendingUp size={22} strokeWidth={2.4} /></span>
+          <span className="brand-text"><strong>India AI Trader</strong><small>Multi-market · paper only</small></span>
+        </a>
+        <nav id="main-nav" className={`nav ${menuOpen ? "is-open" : ""}`} aria-label="Dashboard sections">
+          {VIEWS.map(({ id, label, icon: Icon }) => <button type="button" key={id} className={`nav-item ${view === id ? "is-active" : ""}`}
+            aria-current={view === id ? "page" : undefined} onClick={() => choose(id)}>
+            <Icon size={18} strokeWidth={2.2} aria-hidden="true" /><span>{label}</span>
+          </button>)}
+        </nav>
+        <div className="topbar-status">
+          <span className={`session-pill ${session.is_open ? "is-open" : ""}`} title={session.approximate ? "Estimated from your clock (holidays not checked)" : "From the server’s NSE calendar"}>
+            <i aria-hidden="true" />{session.label}
+          </span>
+          <span className={`mode-badge ${state && !paper ? "is-live" : ""}`} title="Trading mode reported by the server">
+            {health.error && !state ? "Unconfirmed" : !state ? "Checking" : paper ? "Paper" : state.mode || "Not paper"}
+          </span>
+          <span className={`stream-dot ${connected ? "is-on" : ""}`} title={connected ? "Receiving live status updates" : "Live stream unavailable — polling every 5 s"}>
+            <i aria-hidden="true" /><span className="stream-label">{connected ? "Live" : "Polling"}</span>
+          </span>
+        </div>
+        <button type="button" className="menu-toggle" aria-expanded={menuOpen} aria-controls="main-nav"
+          aria-label={menuOpen ? "Close menu" : "Open menu"} onClick={() => setMenuOpen(open => !open)}>
+          {menuOpen ? <X size={22} aria-hidden="true" /> : <Menu size={22} aria-hidden="true" />}
+        </button>
+      </div>
+    </header>
+
+    <main id="main" className="container" tabIndex={-1}>
+      <div className="banners">
+        {state && !paper && <Banner tone="bad" icon={AlertTriangle} role="alert">The server is not reporting paper mode. Stop and investigate before doing anything else.</Banner>}
+        {state?.dead_mans_switch?.halted && <Banner tone="bad" icon={AlertTriangle}>
+          Circuit breaker is halted: {state.dead_mans_switch.halt_reason || "no reason recorded"}. New trades are blocked until you review and clear it on the Overview page.
+        </Banner>}
+        {health.error && <Banner tone="bad" icon={AlertTriangle}>Cannot reach the trading server. Showing the last known values; retrying every 5 seconds.</Banner>}
+        {failed && !health.error && <Banner tone="warn" icon={AlertTriangle}>Some dashboard data is unavailable. Requests retry automatically.</Banner>}
+      </div>
+      {view === "overview" && <Overview state={state} ops={ops} opsUnavailable={operations.error} healthError={health.error}
+        portfolio={portfolio.data} config={config.data} session={session} now={now}
+        busy={busy} reviewed={reviewed} setReviewed={setReviewed} control={control} onNavigate={choose} />}
+      {view === "workspaces" && <Workspaces state={state} ops={ops} portfolio={portfolio.data} session={session} now={now} />}
+      {view === "market" && <Market ops={ops} opsUnavailable={operations.error} watchlist={watchlist} busy={busy} mutate={mutate} />}
+      {view === "portfolio" && <Portfolio portfolio={portfolio.data} config={config.data} equity={equity.data} pnl={pnl.data}
+        trades={trades.data} signals={signals} />}
+      {view === "operations" && <Operations ops={ops} opsUnavailable={operations.error} state={state} busy={busy} mutate={mutate}
+        agents={agents} now={now} />}
+      {view === "ai" && <LLMControls serverState={state?.llm} />}
+      {view === "research" && <Research />}
+      <footer className="footer">
+        <ShieldCheck size={16} aria-hidden="true" />
+        <span>Paper evaluation only — not certified for live trading, and this dashboard has no live-mode controls.
+          Last server update {istDateTime(state?.timestamp)} IST.</span>
+      </footer>
+    </main>
+
+    <div className="toasts" aria-live="polite">
+      {busy && <div className="toast tone-accent"><span className="spinner" aria-hidden="true" />Sending request…</div>}
+      {controlError && <div className="toast tone-bad" role="alert"><AlertTriangle size={18} aria-hidden="true" /><span>{controlError}</span>
+        <button type="button" className="toast-close" aria-label="Dismiss" onClick={() => setControlError("")}><X size={16} /></button></div>}
+      {notice && !controlError && <div className="toast tone-ok"><CheckCircle2 size={18} aria-hidden="true" /><span>{notice}</span>
+        <button type="button" className="toast-close" aria-label="Dismiss" onClick={() => setNotice("")}><X size={16} /></button></div>}
+    </div>
+  </div>;
 }
-function Positions({rows}) { return rows.length ? <Table heads={["Symbol","Qty","Average","LTP","P&L"]}>{rows.map(x=><tr key={x.symbol}><td><b>{x.symbol}</b><small>{x.product}</small></td><td>{x.quantity}</td><td>{precise(x.avg_price)}</td><td>{precise(x.ltp)}</td><td className={x.pnl >= 0 ? "green" : "red"}>{x.pnl >= 0 ? "+" : ""}{precise(x.pnl)}</td></tr>)}</Table>:<Empty>No open positions.</Empty>; }
-function Signals({rows}) { return rows.length ? <div className="signal-list">{rows.slice(0,8).map(x=><article className="signal" key={x.id}><b className={x.signal.includes("BUY")?"buy":x.signal.includes("SELL")?"sell":"hold"}>{x.signal}</b><div><strong>{x.symbol}</strong><p>{x.reasoning || "No rationale recorded"}</p></div><small>{x.confidence ?? "—"}%</small></article>)}</div>:<Empty>No decisions recorded.</Empty>; }
-function Trades({rows}) { return rows.length ? <Table heads={["Time","Symbol","Side","Price","Qty","Strategy","Status","P&L"]}>{rows.slice(0,20).map(x=><tr key={x.id}><td>{x.created_at ? new Date(x.created_at).toLocaleString("en-IN",{hour:"2-digit",minute:"2-digit",day:"2-digit",month:"short"}):"—"}</td><td><b>{x.symbol}</b></td><td><b className={x.action === "BUY" ? "buy" : "sell"}>{x.action}</b></td><td>{precise(x.price)}</td><td>{x.quantity}</td><td>{x.strategy || "Pipeline"}</td><td><small className="pill">{x.status}</small></td><td className={(x.pnl || 0)>=0?"green":"red"}>{x.pnl == null ? "—" : precise(x.pnl)}</td></tr>)}</Table>:<Empty>No executions recorded.</Empty>; }
-function Table({heads,children}) { return <div className="scroll"><table><thead><tr>{heads.map(x=><th key={x}>{x}</th>)}</tr></thead><tbody>{children}</tbody></table></div>; }

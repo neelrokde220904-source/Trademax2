@@ -9,13 +9,17 @@ from typing import Any
 
 import pyotp
 from loguru import logger
+
+from operations.redaction import silence_sdk_logging
 from SmartApi import SmartConnect
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from config.settings import settings
+from broker.base_broker import BaseBrokerAdapter, BrokerRejectedError, OrderSubmissionUncertainError
+from broker.candle_rate_limiter import candle_rate_limiter
 
 
-class AngelClient:
+class AngelClient(BaseBrokerAdapter):
     """Thread-safe Angel One SmartAPI client with auto-TOTP and session refresh."""
 
     def __init__(self) -> None:
@@ -24,7 +28,7 @@ class AngelClient:
         self._refresh_token: str = ""
         self._feed_token: str = ""
         self._last_auth: datetime | None = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._authenticated = False
 
     # ------------------------------------------------------------------
@@ -37,6 +41,7 @@ class AngelClient:
         with self._lock:
             try:
                 self._api = SmartConnect(api_key=settings.angel_api_key)
+                silence_sdk_logging()  # the SDK would write request headers (keys, JWT) to disk
                 totp = pyotp.TOTP(settings.angel_totp_secret).now()
                 data = self._api.generateSession(
                     settings.angel_client_id,
@@ -45,6 +50,7 @@ class AngelClient:
                 )
 
                 if not data or data.get("status") is False:
+                    self._authenticated = False
                     msg = data.get("message", "Unknown auth error") if data else "No response"
                     logger.error("Angel One auth failed: {}", msg)
                     return False
@@ -55,10 +61,7 @@ class AngelClient:
                 self._last_auth = datetime.now()
                 self._authenticated = True
 
-                logger.info(
-                    "Angel One authenticated for client {}. Feed token obtained.",
-                    settings.angel_client_id,
-                )
+                logger.info("Angel One authenticated. Feed token obtained.")
                 return True
 
             except Exception as exc:
@@ -91,10 +94,13 @@ class AngelClient:
     def ensure_session(self) -> None:
         """Ensure we have a valid session; refresh if >6 hours old."""
         if not self._authenticated:
-            self.authenticate()
+            if not self.authenticate():
+                raise RuntimeError("Angel One authentication was rejected")
             return
         if self._last_auth and (datetime.now() - self._last_auth) > timedelta(hours=6):
-            self.refresh_session()
+            if not self.refresh_session():
+                self._authenticated = False
+                raise RuntimeError("Angel One session refresh was rejected")
 
     # ------------------------------------------------------------------
     # Properties
@@ -137,6 +143,10 @@ class AngelClient:
         )
         return all(value and not value.startswith("your_") for value in required)
 
+    def authenticate_totp(self) -> bool:
+        """Authenticate through SmartAPI using the configured TOTP secret."""
+        return self.authenticate()
+
     # ------------------------------------------------------------------
     # Market Data
     # ------------------------------------------------------------------
@@ -169,7 +179,8 @@ class AngelClient:
             "fromdate": from_date,
             "todate": to_date,
         }
-        resp = self.api.getCandleData(params)
+        api = self.api
+        resp = candle_rate_limiter.call(api.getCandleData, params)
         if resp and resp.get("status"):
             return resp.get("data", [])
         logger.warning("getCandleData failed: {}", resp)
@@ -199,8 +210,7 @@ class AngelClient:
     # Orders
     # ------------------------------------------------------------------
 
-    @retry(stop=stop_after_attempt(2), wait=wait_exponential(min=1, max=3))
-    def place_order(self, params: dict[str, Any]) -> dict[str, Any] | None:
+    def place_order(self, params: dict[str, Any]) -> dict[str, Any]:
         """Place an order via Angel One.
 
         Args:
@@ -211,26 +221,40 @@ class AngelClient:
         """
         try:
             resp = self.api.placeOrder(params)
-            logger.info("Order placed: {} → {}", params.get("tradingsymbol"), resp)
+            if isinstance(resp, str) and resp:
+                return {"status": True, "data": {"orderid": resp}}
+            if isinstance(resp, dict) and resp.get("status") is False:
+                raise BrokerRejectedError(
+                    "Angel One explicitly rejected the order"
+                )
+            if not isinstance(resp, dict) or not (resp.get("data") or {}).get("orderid"):
+                raise OrderSubmissionUncertainError("Angel One returned no verifiable order identifier")
+            logger.info("Order submitted for {}; confirmation of fills is still required.", params.get("tradingsymbol"))
             return resp
-        except Exception as exc:
-            logger.exception("Order placement failed for {}: {}", params.get("tradingsymbol"), exc)
+        except (BrokerRejectedError, OrderSubmissionUncertainError):
             raise
+        except Exception as exc:
+            logger.error("Order submission outcome unknown for {} ({}).", params.get("tradingsymbol"), type(exc).__name__)
+            raise OrderSubmissionUncertainError("Angel One order requires reconciliation before retry") from exc
 
-    def modify_order(self, params: dict[str, Any]) -> dict[str, Any] | None:
+    def modify_order(self, params: dict[str, Any]) -> dict[str, Any]:
         """Modify an existing order."""
         try:
             resp = self.api.modifyOrder(params)
+            if not resp or resp.get("status") is False:
+                raise RuntimeError(f"Angel One rejected the modification: {(resp or {}).get('message', 'empty response')}")
             logger.info("Order modified: {}", resp)
             return resp
         except Exception as exc:
             logger.exception("Order modification failed: {}", exc)
             return None
 
-    def cancel_order(self, order_id: str, variety: str = "NORMAL") -> dict[str, Any] | None:
+    def cancel_order(self, order_id: str, variety: str = "NORMAL") -> dict[str, Any]:
         """Cancel an order by order ID."""
         try:
             resp = self.api.cancelOrder(order_id, variety)
+            if not resp or resp.get("status") is False:
+                raise RuntimeError(f"Angel One rejected the cancellation: {(resp or {}).get('message', 'empty response')}")
             logger.info("Order cancelled: {} → {}", order_id, resp)
             return resp
         except Exception as exc:
@@ -245,31 +269,36 @@ class AngelClient:
         """Fetch current holdings."""
         try:
             resp = self.api.holding()
-            if resp and resp.get("status"):
-                return resp.get("data", [])
+            if not resp or resp.get("status") is False:
+                raise RuntimeError(f"Angel One holdings unavailable: {(resp or {}).get('message', 'empty response')}")
+            return resp.get("data") or []
         except Exception as exc:
             logger.error("Holdings fetch error: {}", exc)
-        return []
+            raise
 
     def get_positions(self) -> list[dict[str, Any]]:
         """Fetch current open positions."""
         try:
             resp = self.api.position()
-            if resp and resp.get("status"):
-                return resp.get("data", [])
+            if not resp or resp.get("status") is False:
+                raise RuntimeError(f"Angel One positions unavailable: {(resp or {}).get('message', 'empty response')}")
+            return resp.get("data") or []
         except Exception as exc:
             logger.error("Positions fetch error: {}", exc)
-        return []
+            raise
 
     def get_order_book(self) -> list[dict[str, Any]]:
-        """Fetch the order book."""
+        """Fetch the order book or raise when broker reconciliation is unavailable."""
         try:
             resp = self.api.orderBook()
-            if resp and resp.get("status"):
-                return resp.get("data", []) or []
+            if not resp or resp.get("status") is False:
+                raise RuntimeError(
+                    f"Angel One order book unavailable: {(resp or {}).get('message', 'empty response')}"
+                )
+            return resp.get("data") or []
         except Exception as exc:
             logger.error("Order book fetch error: {}", exc)
-        return []
+            raise
 
     # ------------------------------------------------------------------
     # Margin
@@ -284,6 +313,93 @@ class AngelClient:
         except Exception as exc:
             logger.error("RMS limits fetch error: {}", exc)
         return None
+
+    def get_funds_and_margins(self) -> dict[str, Any]:
+        """Return Angel RMS data or raise if the broker cannot provide it."""
+        limits = self.get_rms_limits()
+        if limits is None:
+            raise RuntimeError("Angel One RMS limits are unavailable")
+        return {"available": limits, "raw": limits}
+
+    def place_bracket_or_gtt_order(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Submit a supported BO order; do not emulate OCO with unlinked orders."""
+        variety = str(params.get("variety", "")).upper()
+        product = str(params.get("producttype", "")).upper()
+        if variety not in {"ROBO", "BO"} and product != "BO":
+            raise NotImplementedError(
+                "Angel One bracket support is available only through broker-approved BO orders."
+            )
+        order_params = dict(params)
+        order_params.setdefault("variety", "ROBO")
+        order_params.setdefault("producttype", "BO")
+        response = self.place_order(order_params)
+        if response is None:
+            raise RuntimeError("Angel One returned no response for the bracket order")
+        return response
+
+    def flatten_all_intraday(self) -> list[dict[str, Any]]:
+        """Close all net intraday positions with opposite-side market orders."""
+        order_book = self.get_order_book()
+        positions = self.api.position()
+        if not positions or positions.get("status") is False:
+            raise RuntimeError("Unable to reconcile Angel One positions before flattening")
+        intraday_positions = [
+            position for position in positions.get("data") or []
+            if int(float(position.get("netqty", 0) or 0)) != 0
+            and str(position.get("producttype", "")).upper() in {"INTRADAY", "MIS"}
+        ]
+        active_symbols = {position.get("tradingsymbol") for position in intraday_positions}
+        unresolved = []
+        terminal_statuses = {"COMPLETE", "COMPLETED", "REJECTED", "CANCELLED", "CANCELED"}
+        for order in order_book:
+            symbol = order.get("tradingsymbol")
+            status = str(order.get("orderstatus") or order.get("status") or "").upper()
+            if symbol in active_symbols and status not in terminal_statuses:
+                unresolved.append(f"{symbol}:{status or 'UNKNOWN'}")
+        if unresolved:
+            raise RuntimeError(
+                "Unresolved broker orders prevent safe square-off: " + ", ".join(unresolved)
+            )
+
+        flattened: list[dict[str, Any]] = []
+        for position in intraday_positions:
+            quantity = int(float(position.get("netqty", 0) or 0))
+            order = {
+                "variety": "NORMAL",
+                "tradingsymbol": position["tradingsymbol"],
+                "symboltoken": position["symboltoken"],
+                "transactiontype": "SELL" if quantity > 0 else "BUY",
+                "exchange": position["exchange"],
+                "ordertype": "MARKET",
+                "producttype": position.get("producttype", "INTRADAY"),
+                "duration": "DAY",
+                "price": "0",
+                "quantity": str(abs(quantity)),
+            }
+            response = self.place_order(order)
+            if response is None:
+                raise RuntimeError(f"Angel One returned no response flattening {position['tradingsymbol']}")
+            flattened.append(response)
+        return flattened
+
+    def subscribe_ticks(
+        self, exchange: str, tokens: list[str], callback: Any
+    ) -> None:
+        """Subscribe to Angel ticks through the shared WebSocket feed."""
+        from broker.websocket_feed import tick_event_bus, ws_feed
+
+        exchange_code = {
+            "NSE": "nse_cm",
+            "NFO": "nse_fo",
+            "BSE": "bse_cm",
+            "BFO": "bse_fo",
+            "MCX": "mcx_fo",
+        }.get(exchange.upper())
+        if exchange_code is None:
+            raise ValueError(f"Unsupported Angel One exchange: {exchange}")
+        tick_event_bus.subscribe(callback)
+        ws_feed.connect()
+        ws_feed.subscribe(exchange_code, tokens)
 
     # ------------------------------------------------------------------
     # Cleanup

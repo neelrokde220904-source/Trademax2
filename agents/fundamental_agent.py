@@ -3,18 +3,56 @@
 from __future__ import annotations
 
 import json
+import math
+from datetime import datetime, timezone
 from typing import Any
 
 import yfinance as yf
 from loguru import logger
 
 from agents.base_agent import BaseAgent, TradingState
-from config.settings import settings
+from agents.llm_client import LLMClient
+from config.llm_runtime import current_profile, llm_operation
 
-try:
-    from langchain_anthropic import ChatAnthropic
-except ImportError:
-    ChatAnthropic = None
+NUMERIC_FIELDS = {
+    "pe_ratio", "forward_pe", "pb_ratio", "roe", "roce", "debt_to_equity",
+    "revenue_growth", "earnings_growth", "profit_margins", "market_cap",
+    "dividend_yield", "book_value", "52w_high", "52w_low", "current_price",
+    "target_mean_price",
+}
+
+
+def validate_fundamentals(data: Any) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        raise ValueError("Fundamental data is unavailable")
+    available = 0
+    for key in NUMERIC_FIELDS:
+        value = data.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ValueError(f"Invalid fundamental metric {key}")
+        available += 1
+    if not available:
+        raise ValueError("No numeric fundamental metrics are available")
+    return data
+
+
+def validate_fundamental_signal(signal: Any) -> dict[str, Any]:
+    if not isinstance(signal, dict) or signal.get("signal") not in {"BUY", "SELL", "HOLD"}:
+        raise ValueError("Invalid fundamental action")
+    confidence = signal.get("confidence")
+    if (
+        isinstance(confidence, bool) or not isinstance(confidence, (int, float))
+        or not math.isfinite(confidence) or not 0 <= confidence <= 100
+    ):
+        raise ValueError("Invalid fundamental confidence")
+    if not isinstance(signal.get("reasoning"), str) or not signal["reasoning"].strip():
+        raise ValueError("Invalid fundamental reasoning")
+    risks = signal.get("key_risks")
+    if not isinstance(risks, list) or not all(isinstance(item, str) for item in risks):
+        raise ValueError("Invalid fundamental risks")
+    return signal
 
 
 class FundamentalAgent(BaseAgent):
@@ -22,32 +60,33 @@ class FundamentalAgent(BaseAgent):
 
     def __init__(self) -> None:
         super().__init__("FundamentalAgent")
-        self._llm = None
-        if ChatAnthropic and settings.anthropic_api_key and not settings.anthropic_api_key.startswith("your_"):
-            self._llm = ChatAnthropic(
-                model=settings.llm_fast_model,
-                api_key=settings.anthropic_api_key,
-                temperature=0.1,
-                max_tokens=1024,
-            )
+        self._llm = LLMClient("fast", "fundamental", max_tokens=1024, temperature=0.1)
 
+    @llm_operation("fundamental")
     def run(self, state: TradingState) -> dict[str, Any]:
         logs: list[str] = []
         errors: list[str] = []
         signals: dict[str, Any] = {}
 
         watchlist = state.get("watchlist", [])
+        captured = state.get("research_fundamental_inputs", {})
+        replay = state.get("research_mode", False)
+        if replay and any(symbol not in captured for symbol in watchlist):
+            raise ValueError("Missing captured fundamental inputs for research replay")
+        inputs: dict[str, Any] = {}
 
         for symbol in watchlist:
             try:
-                fundamentals = self._fetch_fundamentals(symbol)
-                if not fundamentals:
-                    continue
+                fundamentals = captured[symbol] if replay else self._fetch_fundamentals(symbol)
+                fundamentals = validate_fundamentals(fundamentals)
+                inputs[symbol] = fundamentals
 
-                if self._llm:
-                    signal = self._llm_synthesise(symbol, fundamentals)
-                else:
+                if replay and current_profile().mode == "rules":
                     signal = self._rule_based_signal(symbol, fundamentals)
+                elif self._llm:
+                    signal = validate_fundamental_signal(self._llm_synthesise(symbol, fundamentals))
+                else:
+                    raise ValueError("Fundamental model is unavailable")
 
                 signals[symbol] = signal
 
@@ -63,6 +102,7 @@ class FundamentalAgent(BaseAgent):
 
         return {
             "fundamental_signals": signals,
+            "research_fundamental_inputs": inputs,
             "agent_logs": logs,
             "errors": errors,
         }
@@ -85,6 +125,8 @@ class FundamentalAgent(BaseAgent):
                 "profit_margins": info.get("profitMargins"),
                 "market_cap": info.get("marketCap"),
                 "sector": info.get("sector", "Unknown"),
+                "sector_source": "yfinance.Ticker.info",
+                "sector_observed_at": datetime.now(timezone.utc).isoformat(),
                 "industry": info.get("industry", "Unknown"),
                 "dividend_yield": info.get("dividendYield"),
                 "book_value": info.get("bookValue"),
@@ -95,7 +137,7 @@ class FundamentalAgent(BaseAgent):
                 "recommendation": info.get("recommendationKey"),
             }
         except Exception as exc:
-            logger.debug("yfinance fundamentals failed for {}: {}", symbol, exc)
+            logger.warning("yfinance fundamentals unavailable for {} ({})", symbol, type(exc).__name__)
             return None
 
     def _llm_synthesise(self, symbol: str, data: dict) -> dict[str, Any]:
@@ -115,18 +157,15 @@ Indian market context:
 Output ONLY valid JSON (no markdown):
 {{"signal": "BUY/SELL/HOLD", "confidence": 0-100, "reasoning": "...", "key_risks": ["..."]}}"""
 
-        try:
-            resp = self._llm.invoke(prompt)
-            content = resp.content if hasattr(resp, "content") else str(resp)
-            # Extract JSON from response
-            start = content.find("{")
-            end = content.rfind("}") + 1
-            if start >= 0 and end > start:
-                return json.loads(content[start:end])
-        except Exception as exc:
-            logger.error("LLM fundamental synthesis failed for {}: {}", symbol, exc)
-
-        return self._rule_based_signal(symbol, data)
+        resp = self._llm.invoke(prompt)
+        content = resp.content if hasattr(resp, "content") else str(resp)
+        if not isinstance(content, str):
+            raise ValueError("Fundamental response is not text")
+        start = content.find("{")
+        end = content.rfind("}") + 1
+        if start < 0 or end <= start:
+            raise ValueError("Fundamental response contains no JSON object")
+        return json.loads(content[start:end])
 
     def _rule_based_signal(self, symbol: str, data: dict) -> dict[str, Any]:
         """Simple rule-based fundamental scoring when LLM unavailable."""

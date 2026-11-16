@@ -1,0 +1,304 @@
+{
+  "covariance_type": "full",
+  "covars": [
+    [
+      [
+        0.022748032537987815,
+        0.00889304337969997,
+        0.006483171248286064
+      ],
+      [
+        0.00889304337969997,
+        0.3130614102935862,
+        0.06154635052123243
+      ],
+      [
+        0.006483171248286064,
+        0.06154635052123247,
+        0.05398514836945769
+      ]
+    ],
+    [
+      [
+        6.421435239268765,
+        -3.8999908209803054,
+        4.0353181524833195
+      ],
+      [
+        -3.8999908209803054,
+        8.960718086469894,
+        -4.853225858469314
+      ],
+      [
+        4.0353181524833195,
+        -4.853225858469314,
+        4.49778496379437
+      ]
+    ],
+    [
+      [
+        0.2935918591742686,
+        -0.13634130905494984,
+        -0.008105132737107328
+      ],
+      [
+        -0.13634130905494984,
+        1.0682538437352833,
+        -0.13098243799559783
+      ],
+      [
+        -0.008105132737107328,
+        -0.13098243799559783,
+        0.19745114113048348
+      ]
+    ],
+    [
+      [
+        0.043218275298068515,
+        0.00939161826273035,
+        0.00439781029598574
+      ],
+      [
+        0.00939161826273035,
+        0.28654284032434163,
+        -0.024932661788942694
+      ],
+      [
+        0.00439781029598574,
+        -0.024932661788942715,
+        0.05544162997126281
+      ]
+    ]
+  ],
+  "feature_mean": [
+    0.13862496791873558,
+    0.008654418808901812,
+    16.781503355704697
+  ],
+  "feature_scale": [
+    0.08632282780596824,
+    0.04731109530785844,
+    6.635032013521753
+  ],
+  "features": [
+    "realized_vol_20d",
+    "momentum_20d",
+    "india_vix"
+  ],
+  "format": "india-ai-trader/gaussian-hmm-regime/v1",
+  "means": [
+    [
+      -0.6183506561361329,
+      0.2785573742961887,
+      -0.625796029362817
+    ],
+    [
+      3.3276550239949705,
+      -0.7751252330285213,
+      3.5001156480168207
+    ],
+    [
+      0.3946439308108714,
+      0.16490453206533892,
+      0.49090657618352695
+    ],
+    [
+      -0.16088330722764374,
+      -0.40317533282314616,
+      -0.2815831846149424
+    ]
+  ],
+  "metadata": {
+    "candidates": [
+      {
+        "accepted": true,
+        "converged": true,
+        "log_likelihood": -3308.3428,
+        "min_occupancy": 0.0336,
+        "seed": 42
+      },
+      {
+        "accepted": true,
+        "converged": true,
+        "log_likelihood": -4317.7006,
+        "min_occupancy": 0.1754,
+        "seed": 43
+      },
+      {
+        "accepted": true,
+        "converged": true,
+        "log_likelihood": -3308.3428,
+        "min_occupancy": 0.0336,
+        "seed": 44
+      },
+      {
+        "accepted": true,
+        "converged": true,
+        "log_likelihood": -3295.3508,
+        "min_occupancy": 0.0398,
+        "seed": 45
+      },
+      {
+        "accepted": true,
+        "converged": true,
+        "log_likelihood": -3297.4067,
+        "min_occupancy": 0.0336,
+        "seed": 46
+      },
+      {
+        "accepted": true,
+        "converged": true,
+        "log_likelihood": -3297.4067,
+        "min_occupancy": 0.0336,
+        "seed": 47
+      },
+      {
+        "accepted": true,
+        "converged": true,
+        "log_likelihood": -3297.4067,
+        "min_occupancy": 0.0336,
+        "seed": 48
+      },
+      {
+        "accepted": true,
+        "converged": true,
+        "log_likelihood": -4229.589,
+        "min_occupancy": 0.034,
+        "seed": 49
+      },
+      {
+        "accepted": true,
+        "converged": true,
+        "log_likelihood": -3297.4067,
+        "min_occupancy": 0.0336,
+        "seed": 50
+      },
+      {
+        "accepted": true,
+        "converged": true,
+        "log_likelihood": -4229.3423,
+        "min_occupancy": 0.034,
+        "seed": 51
+      }
+    ],
+    "data_end": "2026-11-09",
+    "data_start": "2017-11-01",
+    "log_likelihood": -3295.3508,
+    "log_likelihood_per_observation": -1.47443,
+    "n_observations": 2235,
+    "source": {
+      "features": [
+        "realized_vol_20d",
+        "momentum_20d",
+        "india_vix"
+      ],
+      "india_vix_token": "99926017",
+      "interval": "ONE_DAY",
+      "nifty50_token": "99926000",
+      "nifty_rows": 2257,
+      "provider": "angel_one_historical_candles",
+      "requested_end": "2026-11-10",
+      "requested_start": "2017-10-01",
+      "vix_rows": 2255
+    },
+    "state_profiles": [
+      {
+        "india_vix": 12.629327,
+        "momentum_20d": 0.021833,
+        "occupancy": 0.3441,
+        "realized_vol_20d": 0.085247,
+        "regime": "LOW_VOL_TREND",
+        "state": 0
+      },
+      {
+        "india_vix": 40.004883,
+        "momentum_20d": -0.028018,
+        "occupancy": 0.0398,
+        "realized_vol_20d": 0.425878,
+        "regime": "SYSTEMIC_PANIC",
+        "state": 1
+      },
+      {
+        "india_vix": 20.038684,
+        "momentum_20d": 0.016456,
+        "occupancy": 0.3213,
+        "realized_vol_20d": 0.172692,
+        "regime": "HIGH_VOL_MEAN_REVERT",
+        "state": 2
+      },
+      {
+        "india_vix": 14.91319,
+        "momentum_20d": -0.01042,
+        "occupancy": 0.2949,
+        "realized_vol_20d": 0.124737,
+        "regime": "HIGH_VOL_MEAN_REVERT",
+        "state": 3
+      }
+    ],
+    "trained_at": "2026-11-11T14:00:27.670279+05:30",
+    "validation": {
+      "checks": [
+        {
+          "detail": "panic mean VIX 40.0; highest state mean VIX 40.0",
+          "name": "panic_state_has_highest_vix",
+          "passed": true
+        },
+        {
+          "detail": "panic mean VIX 40.0 (minimum 22)",
+          "name": "panic_state_vix_is_elevated",
+          "passed": true
+        },
+        {
+          "detail": "100% of 14 sessions decoded as SYSTEMIC_PANIC",
+          "name": "march_2020_is_panic",
+          "passed": true
+        }
+      ],
+      "passed": true,
+      "regime_occupancy": {
+        "HIGH_VOL_MEAN_REVERT": 0.6161,
+        "LOW_VOL_TREND": 0.3441,
+        "SYSTEMIC_PANIC": 0.0398
+      }
+    }
+  },
+  "n_components": 4,
+  "regime_map": {
+    "0": "LOW_VOL_TREND",
+    "1": "SYSTEMIC_PANIC",
+    "2": "HIGH_VOL_MEAN_REVERT",
+    "3": "HIGH_VOL_MEAN_REVERT"
+  },
+  "startprob": [
+    1.0,
+    0.0,
+    5.259535918196546e-187,
+    9.71874446870726e-186
+  ],
+  "transmat": [
+    [
+      0.9815463286405927,
+      5.2774651045065804e-161,
+      0.002747607698585959,
+      0.015706063660821563
+    ],
+    [
+      3.365636509492933e-180,
+      0.9769657519314952,
+      0.023034248068504782,
+      4.063472901344094e-124
+    ],
+    [
+      0.0040841337957121665,
+      0.0028370669949204885,
+      0.9828275145022873,
+      0.010251284707080041
+    ],
+    [
+      0.01561174096605758,
+      2.1134027716564495e-41,
+      0.014077287315423756,
+      0.9703109717185187
+    ]
+  ]
+}

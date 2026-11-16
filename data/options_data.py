@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 from datetime import datetime
+import math
 from typing import Any
 
 import pandas as pd
 import pytz
 from loguru import logger
 
-from broker.angel_client import angel_client
-from config.settings import settings
-from data.instrument_master import find_nfo_options
+from data.instrument_master import find_nfo_options, load_instrument_master
 
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -23,10 +22,12 @@ def fetch_options_chain(
     """Fetch the options chain for an underlying (NIFTY / BANKNIFTY).
 
     Returns:
-        DataFrame with columns: strike, option_type, ltp, oi, volume, iv, token, symbol
+        Metadata for the nearest unexpired matching expiry. Prices, OI and volume
+        are missing until a verified options data provider is integrated.
     """
-    ce_options = find_nfo_options(underlying, expiry_contains=expiry_contains, option_type="CE")
-    pe_options = find_nfo_options(underlying, expiry_contains=expiry_contains, option_type="PE")
+    instruments = load_instrument_master()
+    ce_options = find_nfo_options(underlying, expiry_contains=expiry_contains, option_type="CE", instruments=instruments)
+    pe_options = find_nfo_options(underlying, expiry_contains=expiry_contains, option_type="PE", instruments=instruments)
 
     all_options = ce_options + pe_options
 
@@ -34,9 +35,23 @@ def fetch_options_chain(
         logger.warning("No options found for {} (expiry filter: '{}')", underlying, expiry_contains)
         return pd.DataFrame()
 
-    rows = []
+    dated = []
     for opt in all_options:
-        ltp_data = angel_client.get_ltp("NFO", opt["symbol"], opt["token"])
+        try:
+            expiry = datetime.strptime(opt["expiry"].upper(), "%d%b%Y").date()
+        except (TypeError, ValueError):
+            logger.warning("Ignoring option {} with invalid expiry", opt["symbol"])
+            continue
+        if expiry >= datetime.now(IST).date():
+            dated.append((expiry, opt))
+    if not dated:
+        logger.warning("No current option expiry found for {}", underlying)
+        return pd.DataFrame()
+    nearest = min(expiry for expiry, _ in dated)
+    rows = []
+    for expiry, opt in dated:
+        if expiry != nearest:
+            continue
         rows.append({
             "strike": opt["strike"],
             "option_type": opt["option_type"],
@@ -44,16 +59,43 @@ def fetch_options_chain(
             "token": opt["token"],
             "expiry": opt["expiry"],
             "lot_size": opt["lot_size"],
-            "ltp": ltp_data if ltp_data else 0.0,
-            "oi": 0,  # Will be populated from WebSocket or separate API call
-            "volume": 0,
+            "ltp": None,
+            "oi": None,
+            "volume": None,
         })
 
     df = pd.DataFrame(rows)
     df = df.sort_values(["strike", "option_type"]).reset_index(drop=True)
 
-    logger.info("Fetched {} options for {} (expiry: {})", len(df), underlying, expiry_contains)
+    logger.warning(
+        "Options OI and contract quotes unavailable for {}; returning {} metadata-only contracts for {}.",
+        underlying, len(df), nearest,
+    )
     return df
+
+
+def _validated_oi_chain(chain_df: pd.DataFrame) -> pd.DataFrame | None:
+    required = {"strike", "option_type", "oi", "expiry"}
+    if not isinstance(chain_df, pd.DataFrame) or chain_df.empty or not required.issubset(chain_df.columns):
+        return None
+    expiries = chain_df["expiry"]
+    if expiries.isna().any() or expiries.astype(str).str.strip().eq("").any() or expiries.nunique() != 1:
+        return None
+    sides = chain_df["option_type"]
+    if set(sides) != {"CE", "PE"}:
+        return None
+    oi = pd.to_numeric(chain_df["oi"], errors="coerce")
+    strikes = pd.to_numeric(chain_df["strike"], errors="coerce")
+    if (
+        not oi.map(math.isfinite).all()
+        or not strikes.map(math.isfinite).all()
+        or (oi < 0).any()
+        or (strikes <= 0).any()
+        or oi[sides == "CE"].sum() <= 0
+        or oi[sides == "PE"].sum() <= 0
+    ):
+        return None
+    return chain_df.assign(oi=oi, strike=strikes)
 
 
 def calculate_pcr(chain_df: pd.DataFrame) -> float | None:
@@ -62,7 +104,8 @@ def calculate_pcr(chain_df: pd.DataFrame) -> float | None:
     PCR > 1.2 = bearish sentiment (contrarian buy signal)
     PCR < 0.7 = bullish sentiment (contrarian sell signal)
     """
-    if chain_df.empty:
+    chain_df = _validated_oi_chain(chain_df)
+    if chain_df is None:
         return None
 
     ce_oi = chain_df[chain_df["option_type"] == "CE"]["oi"].sum()
@@ -79,7 +122,8 @@ def calculate_max_pain(chain_df: pd.DataFrame, spot_price: float) -> float | Non
 
     Price tends to gravitate towards max pain at expiry.
     """
-    if chain_df.empty:
+    chain_df = _validated_oi_chain(chain_df)
+    if chain_df is None:
         return None
 
     strikes = sorted(chain_df["strike"].unique())
@@ -112,7 +156,8 @@ def calculate_max_pain(chain_df: pd.DataFrame, spot_price: float) -> float | Non
 
 def find_max_oi_strikes(chain_df: pd.DataFrame) -> dict[str, Any]:
     """Find strikes with maximum OI for CE and PE — these act as support/resistance."""
-    if chain_df.empty:
+    chain_df = _validated_oi_chain(chain_df)
+    if chain_df is None:
         return {"max_ce_oi_strike": None, "max_pe_oi_strike": None}
 
     ce_data = chain_df[chain_df["option_type"] == "CE"]
@@ -145,7 +190,8 @@ def detect_unusual_oi(chain_df: pd.DataFrame, threshold_multiplier: float = 2.0)
     Returns:
         List of dicts for options with unusual OI.
     """
-    if chain_df.empty:
+    chain_df = _validated_oi_chain(chain_df)
+    if chain_df is None:
         return []
 
     mean_oi = chain_df["oi"].mean()

@@ -31,17 +31,22 @@ class MacroAgent(BaseAgent):
 
         # Fetch macro data points
         macro_data: dict[str, Any] = {}
+        captured = state.get("research_macro_inputs", {})
+        replay = state.get("research_mode", False)
+        required = ("global_cues", "usdinr", "crude_oil", "fii_dii")
+        if replay and any(name not in captured for name in required):
+            raise ValueError("Missing captured macro inputs for research replay")
 
         # --- Global Market Cues ---
-        global_cues = self._fetch_global_cues()
+        global_cues = captured["global_cues"] if replay else self._fetch_global_cues()
         macro_data["global_cues"] = global_cues
 
         # --- USD/INR ---
-        usdinr = self._fetch_usdinr()
+        usdinr = captured["usdinr"] if replay else self._fetch_usdinr()
         macro_data["usdinr"] = usdinr
 
         # --- Crude Oil ---
-        crude = self._fetch_crude_oil()
+        crude = captured["crude_oil"] if replay else self._fetch_crude_oil()
         macro_data["crude_oil"] = crude
 
         # --- India VIX assessment ---
@@ -49,7 +54,7 @@ class MacroAgent(BaseAgent):
         macro_data["vix_assessment"] = vix_assessment
 
         # --- FII/DII Data ---
-        fii_dii = self._fetch_fii_dii()
+        fii_dii = captured["fii_dii"] if replay else self._fetch_fii_dii()
         macro_data["fii_dii"] = fii_dii
 
         # Derive overall macro signal
@@ -73,6 +78,7 @@ class MacroAgent(BaseAgent):
         return {
             "macro_signals": signals,
             "fii_dii_data": fii_dii,
+            "research_macro_inputs": {name: macro_data[name] for name in required},
             "agent_logs": logs,
             "errors": errors,
         }

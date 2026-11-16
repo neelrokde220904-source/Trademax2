@@ -4,11 +4,12 @@ Instead of unstructured LLM conversation, forces each side to produce
 machine-readable JSON arguments. Only trades where conviction_score > 70
 from the debate proceed to the Risk Manager.
 
-This single filter eliminates the majority of false-positive trades.
+Conviction is an uncalibrated model score, not a probability of success.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any
 
@@ -17,27 +18,19 @@ from loguru import logger
 from agents.base_agent import TradingState
 from config.settings import settings
 
-try:
-    from anthropic import Anthropic
-    ANTHROPIC_AVAILABLE = True
-except ImportError:
-    ANTHROPIC_AVAILABLE = False
+from agents.llm_client import LLMClient, complete
+from agents.review_context import (
+    CONVICTION_THRESHOLD, MAX_DEBATE_CONTEXT_BYTES, ReviewContextError,
+    candidate_review_identity, serialize_review_context, technical_review_digest,
+)
+from config.llm_runtime import llm_operation
 
 
-CONVICTION_THRESHOLD = 70  # FIRM — never lower this threshold
-
-
-def _call_claude(model: str, prompt: str, max_tokens: int = 1500) -> str:
-    """Call Claude API with the given prompt."""
-    if not ANTHROPIC_AVAILABLE or not settings.anthropic_api_key:
+@llm_operation("bull_bear")
+def _call_llm(role: str, prompt: str, max_tokens: int = 1500) -> str:
+    if not LLMClient(role, "bull_bear"):
         return "{}"
-    client = Anthropic(api_key=settings.anthropic_api_key)
-    response = client.messages.create(
-        model=model,
-        max_tokens=max_tokens,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return response.content[0].text if response.content else "{}"
+    return complete(role, prompt, max_tokens, task="bull_bear")
 
 
 def _parse_json_response(text: str) -> dict[str, Any]:
@@ -73,9 +66,10 @@ class BullBearSynthesisAgent:
     """
 
     def __init__(self) -> None:
-        self.fast_model = settings.llm_fast_model
-        self.decision_model = settings.llm_decision_model
+        self.fast_model = "fast"
+        self.decision_model = "decision"
 
+    @llm_operation("bull_bear")
     def run(self, state: TradingState) -> dict[str, Any]:
         """Run debate for all symbols in watchlist with analyst signals.
 
@@ -100,11 +94,40 @@ class BullBearSynthesisAgent:
         # Collect analyst signals for each symbol
         for symbol in watchlist:
             try:
+                if not state.get("research_mode"):
+                    from agents.sentiment_agent import validate_candidate_sentiment
+                    from agents.sentiment_evidence import sentiment_digest
+                    try:
+                        sentiment_review_digest = sentiment_digest(validate_candidate_sentiment(state, symbol))
+                    except (TypeError, ValueError):
+                        errors.append(f"[BullBearDebate] {symbol}: required sentiment is unavailable or invalid")
+                        continue
+                    try:
+                        technical = state.get("technical_signals", {}).get(symbol)
+                        technical_digest = technical_review_digest(technical)
+                        candidate_id = candidate_review_identity(state, symbol)
+                    except (AttributeError, ReviewContextError) as exc:
+                        errors.append(f"[BullBearDebate] {symbol}: required technical evidence is invalid: {exc}")
+                        continue
                 analyst_signals = self._collect_signals(symbol, state)
                 if not analyst_signals:
                     continue
 
                 result = self.run_debate(symbol, analyst_signals, state)
+                if not state.get("research_mode"):
+                    try:
+                        if (
+                            technical_review_digest(state.get("technical_signals", {}).get(symbol)) != technical_digest
+                            or candidate_review_identity(state, symbol) != candidate_id
+                        ):
+                            errors.append(f"[BullBearDebate] {symbol}: technical evidence changed during review")
+                            continue
+                    except (AttributeError, ReviewContextError) as exc:
+                        errors.append(f"[BullBearDebate] {symbol}: required technical evidence is invalid: {exc}")
+                        continue
+                    result["sentiment_review_digest"] = sentiment_review_digest
+                    result["technical_review_digest"] = technical_digest
+                    result["candidate_id"] = candidate_id
                 debate_results[symbol] = result
 
                 conviction = result.get("conviction_score", 0)
@@ -134,17 +157,39 @@ class BullBearSynthesisAgent:
             "errors": errors,
         }
 
+    @llm_operation("bull_bear")
     def run_debate(self, symbol: str, analyst_signals: dict[str, Any],
                    state: TradingState) -> dict[str, Any]:
         """Run the full Bull vs. Bear debate for a single symbol."""
+        context_json = self._debate_context(symbol, analyst_signals, state)
+
+        def verify_context() -> None:
+            if self._debate_context(symbol, analyst_signals, state) != context_json:
+                raise ReviewContextError("debate context changed during review")
+
         # Step 1: Bull Researcher argues FOR
-        bull_argument = self._run_bull_researcher(symbol, analyst_signals, state)
+        bull_argument = self._run_bull_researcher(symbol, analyst_signals, state, context_json)
+        verify_context()
 
         # Step 2: Bear Researcher argues AGAINST (sees the bull case)
-        bear_argument = self._run_bear_researcher(symbol, analyst_signals, bull_argument, state)
+        bear_argument = self._run_bear_researcher(symbol, analyst_signals, bull_argument, state, context_json)
+        verify_context()
 
         # Step 3: Synthesis — Portfolio Manager judges the debate
-        verdict = self._synthesize_debate(symbol, bull_argument, bear_argument, state)
+        verdict = self._synthesize_debate(symbol, bull_argument, bear_argument, state, context_json)
+        verify_context()
+        review_complete = all((
+            bull_argument.get("_review_succeeded") is True,
+            bear_argument.get("_review_succeeded") is True,
+            verdict.get("_review_succeeded") is True,
+        ))
+        verdict["review_complete"] = review_complete
+        verdict["arguments"] = {"bull": bull_argument, "bear": bear_argument}
+        verdict["debate_context_sha256"] = hashlib.sha256(context_json.encode("utf-8")).hexdigest()
+        verdict["debate_context_json"] = context_json
+        if not review_complete:
+            verdict["action"] = "HOLD"
+            verdict["conviction_score"] = 0
 
         return verdict
 
@@ -162,16 +207,30 @@ class BullBearSynthesisAgent:
 
         return signals
 
+    def _debate_context(self, symbol: str, reports: dict[str, Any], state: TradingState) -> str:
+        context = {
+            "reports": {
+                name: reports.get(name)
+                for name in ("technical", "fundamental", "sentiment", "options", "macro", "india")
+            },
+            "live_quote": state.get("live_quotes", {}).get(symbol),
+            "hmm_regime": state.get("hmm_regime"),
+            "india_vix": state.get("india_vix"),
+            "geopolitical_risks": state.get("geopolitical_risks"),
+            "order_flow": state.get("ofi_signals", {}).get(symbol),
+            "portfolio_value": state.get("portfolio_value"),
+            "available_capital": state.get("available_capital"),
+            "current_positions": state.get("current_positions"),
+        }
+        return serialize_review_context(context, max_bytes=MAX_DEBATE_CONTEXT_BYTES)
+
     def _run_bull_researcher(self, symbol: str, reports: dict[str, Any],
-                             state: TradingState) -> dict[str, Any]:
+                             state: TradingState, context_json: str | None = None) -> dict[str, Any]:
         """Bull side — build the strongest possible case FOR buying."""
-        from agents.state_condenser import condense_for_debate, state_to_prompt_json
-
-        ltp = state.get("live_quotes", {}).get(symbol, {}).get("ltp", "N/A")
-        regime = state.get("hmm_regime", {}).get("regime", "UNKNOWN")
-
-        condensed = condense_for_debate(state, symbol)
-        reports_str = state_to_prompt_json(condensed, max_chars=3000)
+        reports_str = context_json if context_json is not None else self._debate_context(symbol, reports, state)
+        context = json.loads(reports_str)
+        ltp = (context.get("live_quote") or {}).get("ltp", "N/A")
+        regime = (context.get("hmm_regime") or {}).get("regime", "UNKNOWN")
 
         prompt = f"""You are the BULL RESEARCHER. Your sole job is to build the strongest 
 possible case FOR buying {symbol}.
@@ -195,10 +254,19 @@ Respond ONLY in this JSON format:
     "bull_confidence": 75
 }}"""
 
-        response = _call_claude(self.fast_model, prompt)
+        response = _call_llm(self.fast_model, prompt)
         result = _parse_json_response(response)
 
-        if not result:
+        confidence = result.get("bull_confidence")
+        probability = result.get("probability")
+        valid = (
+            isinstance(result.get("thesis"), str) and bool(result["thesis"].strip())
+            and type(confidence) in (int, float) and 0 < confidence <= 100
+            and type(probability) in (int, float) and 0 <= probability <= 1
+            and isinstance(result.get("supporting_factors"), list)
+            and isinstance(result.get("key_catalysts"), list)
+        )
+        if not valid:
             result = {
                 "thesis": "Unable to generate bull thesis",
                 "upside_target": 0.0,
@@ -206,22 +274,22 @@ Respond ONLY in this JSON format:
                 "supporting_factors": [],
                 "key_catalysts": [],
                 "bull_confidence": 0,
+                "_review_succeeded": False,
             }
+        else:
+            result["_review_succeeded"] = True
 
         return result
 
     def _run_bear_researcher(self, symbol: str, reports: dict[str, Any],
                              bull_argument: dict[str, Any],
-                             state: TradingState) -> dict[str, Any]:
+                             state: TradingState, context_json: str | None = None) -> dict[str, Any]:
         """Bear side — destroy the bull case and identify all downside risks."""
-        from agents.state_condenser import condense_for_debate, state_to_prompt_json
-
-        ltp = state.get("live_quotes", {}).get(symbol, {}).get("ltp", "N/A")
-        regime = state.get("hmm_regime", {}).get("regime", "UNKNOWN")
-
-        condensed = condense_for_debate(state, symbol)
-        reports_str = state_to_prompt_json(condensed, max_chars=2000)
-        bull_str = json.dumps(bull_argument, default=str, indent=2)[:1500]
+        reports_str = context_json if context_json is not None else self._debate_context(symbol, reports, state)
+        context = json.loads(reports_str)
+        ltp = (context.get("live_quote") or {}).get("ltp", "N/A")
+        regime = (context.get("hmm_regime") or {}).get("regime", "UNKNOWN")
+        bull_str = serialize_review_context(bull_argument, max_bytes=MAX_DEBATE_CONTEXT_BYTES)
 
         prompt = f"""You are the BEAR RESEARCHER. Your sole job is to destroy the bull case 
 for {symbol} and identify all downside risks.
@@ -248,10 +316,19 @@ Respond ONLY in this JSON format:
     "bear_confidence": 60
 }}"""
 
-        response = _call_claude(self.fast_model, prompt)
+        response = _call_llm(self.fast_model, prompt)
         result = _parse_json_response(response)
 
-        if not result:
+        confidence = result.get("bear_confidence")
+        probability = result.get("probability")
+        valid = (
+            isinstance(result.get("counter_thesis"), str) and bool(result["counter_thesis"].strip())
+            and type(confidence) in (int, float) and 0 < confidence <= 100
+            and type(probability) in (int, float) and 0 <= probability <= 1
+            and isinstance(result.get("risk_factors"), list)
+            and isinstance(result.get("bull_case_weaknesses"), list)
+        )
+        if not valid:
             result = {
                 "counter_thesis": "Unable to generate bear thesis",
                 "downside_risk": 0.0,
@@ -259,23 +336,29 @@ Respond ONLY in this JSON format:
                 "risk_factors": [],
                 "bull_case_weaknesses": [],
                 "bear_confidence": 0,
+                "_review_succeeded": False,
             }
+        else:
+            result["_review_succeeded"] = True
 
         return result
 
     def _synthesize_debate(self, symbol: str,
                            bull: dict[str, Any],
                            bear: dict[str, Any],
-                           state: TradingState) -> dict[str, Any]:
+                           state: TradingState, context_json: str | None = None) -> dict[str, Any]:
         """Portfolio Manager synthesizes the debate — final judgment.
 
         Uses claude-opus for the most capable reasoning.
         """
-        regime = state.get("hmm_regime", {}).get("regime", "UNKNOWN")
-        vix = state.get("india_vix", 0)
+        context = json.loads(context_json) if context_json is not None else {
+            "hmm_regime": state.get("hmm_regime"), "india_vix": state.get("india_vix", 0),
+        }
+        regime = (context.get("hmm_regime") or {}).get("regime", "UNKNOWN")
+        vix = context.get("india_vix", 0)
 
-        bull_str = json.dumps(bull, default=str, indent=2)[:1500]
-        bear_str = json.dumps(bear, default=str, indent=2)[:1500]
+        bull_str = serialize_review_context(bull, max_bytes=MAX_DEBATE_CONTEXT_BYTES)
+        bear_str = serialize_review_context(bear, max_bytes=MAX_DEBATE_CONTEXT_BYTES)
 
         prompt = f"""You are the PORTFOLIO MANAGER making the final trading decision for {symbol}.
 
@@ -317,19 +400,26 @@ Where:
 - time_horizon: "INTRADAY", "SWING", or "POSITIONAL"
 """
 
-        response = _call_claude(self.decision_model, prompt)
+        response = _call_llm(self.decision_model, prompt)
         result = _parse_json_response(response)
 
-        if not result:
+        conviction = result.get("conviction_score")
+        valid = (
+            result.get("action") in {"BUY", "SELL", "HOLD"}
+            and type(conviction) in (int, float) and 0 <= conviction <= 100
+            and isinstance(result.get("reasoning"), str) and bool(result["reasoning"].strip())
+        )
+        if not valid:
             return {
                 "action": "HOLD",
                 "conviction_score": 0,
                 "reasoning": "Failed to synthesize debate",
                 "winning_argument": "neutral",
+                "_review_succeeded": False,
             }
 
+        result["_review_succeeded"] = True
         # Enforce conviction threshold
-        conviction = result.get("conviction_score", 0)
         if conviction < CONVICTION_THRESHOLD:
             result["action"] = "HOLD"
             result["reasoning"] = (

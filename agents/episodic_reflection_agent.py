@@ -15,9 +15,10 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
+import pandas as pd
 from loguru import logger
 
 from config.settings import settings
@@ -29,14 +30,44 @@ try:
 except ImportError:
     CHROMADB_AVAILABLE = False
 
-try:
-    from anthropic import Anthropic
-    ANTHROPIC_AVAILABLE = True
-except ImportError:
-    ANTHROPIC_AVAILABLE = False
+from agents.llm_client import LLMClient, complete
+from config.llm_runtime import llm_operation
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VECTOR_DB_DIR = os.path.join(PROJECT_ROOT, "vector_db", "trade_memory")
+
+
+def _nifty_daily_return(entry_at: datetime, exit_at: datetime) -> float:
+    """Fetch Nifty 50 five-minute closes spanning a completed trade."""
+    import yfinance as yf
+
+    start = entry_at.date().isoformat()
+    end = (exit_at.date() + timedelta(days=1)).isoformat()
+    history = yf.download(
+        "^NSEI", start=start, end=end, interval="5m",
+        auto_adjust=True, progress=False, threads=False,
+    )
+    if history.empty:
+        raise RuntimeError(f"No ^NSEI five-minute history for {start} through {end}")
+    close = history["Close"]
+    if hasattr(close, "columns"):
+        close = close.iloc[:, 0]
+    index = pd.DatetimeIndex(pd.to_datetime(close.index))
+    if index.tz is None:
+        index = index.tz_localize("Asia/Kolkata")
+    else:
+        index = index.tz_convert("Asia/Kolkata")
+    entry = pd.Timestamp(entry_at)
+    exit_ = pd.Timestamp(exit_at)
+    entry = entry.tz_localize("Asia/Kolkata") if entry.tzinfo is None else entry.tz_convert("Asia/Kolkata")
+    exit_ = exit_.tz_localize("Asia/Kolkata") if exit_.tzinfo is None else exit_.tz_convert("Asia/Kolkata")
+    close.index = index
+    close = pd.to_numeric(close, errors="coerce").dropna()
+    before_entry = close.loc[close.index <= entry]
+    through_exit = close.loc[close.index <= exit_]
+    if before_entry.empty or through_exit.empty or before_entry.iloc[-1] <= 0:
+        raise RuntimeError(f"Unable to align ^NSEI bars to trade interval {entry_at}..{exit_at}")
+    return float((through_exit.iloc[-1] / before_entry.iloc[-1] - 1) * 100)
 
 
 class TradeEpisode:
@@ -277,6 +308,96 @@ class EpisodicReflectionAgent:
         )
         self.memory.store_episode(episode)
 
+    def settle_all_pending(
+        self,
+        benchmark_return_provider: Callable[[datetime, datetime], float] | None = None,
+    ) -> dict[str, Any]:
+        """Score closed trades once, persist benchmark alpha, and append audit entries.
+
+        A benchmark provider is injectable for deterministic testing. The
+        default uses daily Nifty 50 closes; provider failures are surfaced and
+        do not mark a trade settled.
+        """
+        from sqlalchemy import select
+
+        from backtester.costs import round_trip_cost
+        from database.db import get_db
+        from database.hash_ledger import hash_ledger
+        from database.models import (
+            ClosedTrade, StrategyAlphaWeight, TradeReflectionSettlement,
+        )
+
+        provider = benchmark_return_provider or _nifty_daily_return
+        with get_db() as database:
+            closed = database.execute(
+                select(ClosedTrade).where(ClosedTrade.entry_timestamp.is_not(None))
+            ).scalars().all()
+            settled_ids = set(database.execute(
+                select(TradeReflectionSettlement.trade_id)
+            ).scalars().all())
+            pending = [
+                {
+                    "id": trade.id, "symbol": trade.symbol, "action": trade.action,
+                    "quantity": trade.quantity, "entry_price": trade.entry_price,
+                    "exit_price": trade.exit_price, "entry_at": trade.entry_timestamp,
+                    "exit_at": trade.exit_timestamp,
+                    "gross_pnl": trade.gross_pnl, "strategy": trade.strategy or "unknown",
+                    "holding_period": trade.holding_period or "INTRADAY",
+                }
+                for trade in closed if trade.id not in settled_ids
+            ]
+
+        processed = 0
+        for trade in pending:
+            if not trade["exit_at"] or trade["entry_price"] <= 0 or trade["quantity"] <= 0:
+                raise ValueError(f"Closed trade {trade['id']} is missing valid settlement data")
+            intraday = trade["holding_period"].upper() == "INTRADAY"
+            costs = round_trip_cost(
+                trade["entry_price"], trade["exit_price"], trade["quantity"],
+                is_intraday=intraday,
+                is_entry_buy=trade["action"].upper() == "BUY",
+            )
+            net_pnl = float(trade["gross_pnl"] - costs)
+            capital = trade["entry_price"] * trade["quantity"]
+            net_return = net_pnl / capital * 100
+            benchmark_return = float(provider(trade["entry_at"], trade["exit_at"]))
+            if not np.isfinite(benchmark_return):
+                raise ValueError(f"Nifty benchmark return is invalid for trade {trade['id']}")
+            alpha = net_return - benchmark_return
+            reflection = {
+                "trade_id": trade["id"], "symbol": trade["symbol"],
+                "strategy": trade["strategy"], "net_pnl": net_pnl,
+                "net_return_pct": net_return, "benchmark_return_pct": benchmark_return,
+                "alpha_pct": alpha, "costs": costs,
+                "market_context": {"benchmark": "^NSEI"},
+            }
+            with get_db() as database:
+                if database.query(TradeReflectionSettlement).filter_by(trade_id=trade["id"]).first():
+                    continue
+                database.add(TradeReflectionSettlement(
+                    trade_id=trade["id"], net_pnl=net_pnl, net_return_pct=net_return,
+                    benchmark_return_pct=benchmark_return, alpha_pct=alpha,
+                    reflection_json=json.dumps(reflection, sort_keys=True),
+                ))
+                weight = database.get(StrategyAlphaWeight, trade["strategy"])
+                if weight is None:
+                    weight = StrategyAlphaWeight(strategy=trade["strategy"], samples=0, mean_alpha_pct=0.0)
+                    database.add(weight)
+                weight.samples += 1
+                weight.mean_alpha_pct += (alpha - weight.mean_alpha_pct) / weight.samples
+            self.store_completed_trade({
+                "symbol": trade["symbol"], "action": trade["action"],
+                "entry_price": trade["entry_price"], "exit_price": trade["exit_price"],
+                "entry_date": trade["entry_at"].isoformat(),
+                "exit_date": trade["exit_at"].isoformat(),
+                "quantity": trade["quantity"], "pnl": net_pnl, "pnl_pct": net_return,
+                "strategy": trade["strategy"], "market_context": {"benchmark": "^NSEI"},
+            })
+            hash_ledger.append("trade_settlement", reflection)
+            processed += 1
+        return {"settled": processed, "pending": len(pending), "benchmark": "^NSEI"}
+
+    @llm_operation("reflection")
     def run_weekly_reflection(self, state: dict[str, Any] | None = None) -> dict[str, Any]:
         """Weekly root-cause analysis and heuristic generation.
 
@@ -320,7 +441,7 @@ class EpisodicReflectionAgent:
 
     def _classify_root_causes(self, losses: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Classify each loss into a root cause category."""
-        if not ANTHROPIC_AVAILABLE or not settings.anthropic_api_key:
+        if not LLMClient("fast", "reflection"):
             return self._rule_based_classification(losses)
 
         loss_summaries = "\n".join(
@@ -345,13 +466,7 @@ Output ONLY JSON array:
 [{{"loss_index": 0, "category": "REGIME_MISMATCH", "explanation": "...", "severity": 7}}]"""
 
         try:
-            client = Anthropic(api_key=settings.anthropic_api_key)
-            response = client.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=1000,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            text = response.content[0].text if response.content else "[]"
+            text = complete("fast", prompt, max_tokens=1000, task="reflection", intent="array")
             start = text.find("[")
             end = text.rfind("]") + 1
             if start >= 0 and end > start:
@@ -386,7 +501,7 @@ Output ONLY JSON array:
     def _generate_heuristics(self, root_causes: list[dict[str, Any]],
                              losses: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Generate actionable heuristics from root cause analysis."""
-        if not ANTHROPIC_AVAILABLE or not settings.anthropic_api_key:
+        if not LLMClient("fast", "reflection"):
             return self._rule_based_heuristics(root_causes)
 
         causes_text = json.dumps(root_causes[:10], default=str)
@@ -410,13 +525,7 @@ Output ONLY JSON array:
   "confidence": 0.8}}]"""
 
         try:
-            client = Anthropic(api_key=settings.anthropic_api_key)
-            response = client.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=1000,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            text = response.content[0].text if response.content else "[]"
+            text = complete("fast", prompt, max_tokens=1000, task="reflection", intent="array")
             start = text.find("[")
             end = text.rfind("]") + 1
             if start >= 0 and end > start:

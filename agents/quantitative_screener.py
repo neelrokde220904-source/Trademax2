@@ -2,9 +2,9 @@
 
 Runs AFTER hmm_regime, BEFORE the analyst fan-out. Reduces the number of symbols
 sent to expensive LLM agents by eliminating:
-- Stocks with insufficient volume (< 1.5× 20-day avg)
+- Stocks whose session-to-date volume is below prior sessions at the same time
 - Stocks with ADX < 15 (no trend)
-- Stocks trading inside a narrow range (ATR/Close < 0.005)
+- Stocks trading inside a narrow range (15-minute ATR/Close < SCREENER_MIN_ATR_PCT)
 - Stocks on F&O ban list
 
 This is a pure-Python, zero-LLM-cost gate that typically removes 30-60% of the
@@ -25,6 +25,15 @@ from loguru import logger
 
 from agents.base_agent import TradingState
 from config.settings import settings
+from data.indicators import (
+    average_daily_turnover_inr,
+    bar_relative_volume,
+    best_quote_spread_pct,
+    completed_intraday_bars,
+    is_current_session_breakout,
+    is_vwap_chop,
+    session_relative_volume,
+)
 
 
 class QuantitativeScreener:
@@ -32,13 +41,15 @@ class QuantitativeScreener:
 
     def __init__(
         self,
-        min_volume_ratio: float = 1.5,
+        min_volume_ratio: float | None = None,
         min_adx: float = 15.0,
-        min_atr_pct: float = 0.005,
+        min_atr_pct: float | None = None,
     ) -> None:
-        self.min_volume_ratio = min_volume_ratio
+        self.min_volume_ratio = (
+            settings.screener_min_relative_volume if min_volume_ratio is None else min_volume_ratio
+        )
         self.min_adx = min_adx
-        self.min_atr_pct = min_atr_pct
+        self.min_atr_pct = settings.screener_min_atr_pct if min_atr_pct is None else min_atr_pct
 
     def screen(self, state: TradingState) -> dict[str, Any]:
         """Screen the watchlist and return only qualified symbols.
@@ -47,12 +58,17 @@ class QuantitativeScreener:
         """
         watchlist = state.get("watchlist", [])
         market_data = state.get("market_data", {})
+        live_quotes = state.get("live_quotes", {})
         regime = state.get("hmm_regime", {})
 
-        if not watchlist or not market_data:
+        if not watchlist:
             return {
                 "watchlist": watchlist,
-                "agent_logs": ["[QuantScreener] No data — passing all symbols through."],
+                "screener_results": {
+                    "qualified": [], "rejected": [], "reasons": {},
+                    "original_count": 0, "qualified_count": 0,
+                },
+                "agent_logs": ["[QuantScreener] Empty watchlist — no symbols to analyze."],
             }
 
         qualified: list[str] = []
@@ -61,17 +77,15 @@ class QuantitativeScreener:
 
         for symbol in watchlist:
             df = market_data.get(symbol)
-            if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+            if not isinstance(df, pd.DataFrame) or df.empty:
                 rejected.append(symbol)
                 reasons[symbol] = "no_data"
                 continue
 
-            if not isinstance(df, pd.DataFrame):
-                # If data isn't a DataFrame (e.g., dict from API), pass through
-                qualified.append(symbol)
-                continue
-
-            passed, reason = self._check_symbol(symbol, df, regime)
+            passed, reason = self._check_symbol(
+                symbol, df, regime, state.get("research_as_of") or None,
+                live_quotes.get(symbol),
+            )
             if passed:
                 qualified.append(symbol)
             else:
@@ -103,9 +117,13 @@ class QuantitativeScreener:
             "agent_logs": logs,
         }
 
-    def _check_symbol(self, symbol: str, df: pd.DataFrame, regime: dict) -> tuple[bool, str]:
+    def _check_symbol(
+        self, symbol: str, df: pd.DataFrame, regime: dict, as_of: str | None = None,
+        quote: dict | None = None,
+    ) -> tuple[bool, str]:
         """Run all numeric checks on a single symbol."""
         try:
+            df = completed_intraday_bars(df, as_of)
             if len(df) < 20:
                 return False, "insufficient_bars"
 
@@ -115,14 +133,47 @@ class QuantitativeScreener:
             low = df["low"] if "low" in df.columns else None
 
             if close is None or volume is None:
-                return True, ""  # Pass through if can't calculate
+                return False, "missing_ohlcv"
 
-            # Volume check: today vs 20-day average
-            if volume is not None and len(volume) >= 20:
-                avg_vol = volume.iloc[-20:].mean()
-                current_vol = volume.iloc[-1]
-                if avg_vol > 0 and current_vol / avg_vol < self.min_volume_ratio:
-                    return False, "low_volume"
+            turnover = average_daily_turnover_inr(
+                df, as_of,
+                minimum_sessions=settings.screener_min_liquidity_sessions,
+            )
+            if turnover is None:
+                return False, "liquidity_history_unavailable"
+            if turnover < settings.screener_min_average_daily_turnover_inr:
+                return False, "low_daily_turnover"
+
+            spread_pct = best_quote_spread_pct(
+                quote, as_of, max_age_seconds=settings.screener_max_quote_age_seconds,
+            )
+            if spread_pct is None:
+                return False, "spread_unavailable"
+            if spread_pct > settings.screener_max_spread_pct:
+                return False, "wide_spread"
+
+            # Volume check: session-to-date volume vs prior sessions at the same time of day,
+            # using closed bars only (the in-progress bar's volume is always tiny).
+            relative_volume = session_relative_volume(df, as_of)
+            if relative_volume is None:
+                return False, "volume_unavailable"
+            if relative_volume < self.min_volume_ratio:
+                return False, "low_volume"
+            if is_vwap_chop(
+                df, as_of,
+                lookback_bars=settings.screener_vwap_chop_bars,
+                band_pct=settings.screener_vwap_chop_band_pct,
+            ):
+                return False, "vwap_chop"
+            if is_current_session_breakout(
+                df, as_of, lookback_bars=settings.screener_breakout_lookback_bars,
+            ):
+                breakout_volume = bar_relative_volume(df, as_of)
+                if (
+                    breakout_volume is None
+                    or breakout_volume < settings.screener_breakout_min_relative_volume
+                ):
+                    return False, "breakout_relative_volume"
 
             # ADX check (skip in SYSTEMIC_PANIC — we don't trade anyway)
             if regime.get("regime") != "SYSTEMIC_PANIC" and high is not None and low is not None:
@@ -148,8 +199,8 @@ class QuantitativeScreener:
             return True, ""
 
         except Exception as exc:
-            logger.debug("[QuantScreener] {} check error: {} — passing through.", symbol, exc)
-            return True, ""  # On error, let it through
+            logger.exception("[QuantScreener] {} check failed; rejecting symbol.", symbol)
+            return False, "screening_error"
 
 
 def quantitative_screener_node(state: TradingState) -> dict[str, Any]:

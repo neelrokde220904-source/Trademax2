@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 from typing import Any
+import math
 
-from loguru import logger
+import pandas as pd
 
 from agents.base_agent import BaseAgent, TradingState
 from broker.angel_client import angel_client
 from broker.portfolio_tracker import portfolio_tracker
 from broker.websocket_feed import ws_feed
 from config.instruments import get_token
-from config.settings import settings
-from data.market_data import fetch_multiple, fetch_index_data
+from data.market_data import fetch_india_vix, fetch_multiple
+from operations.history_evidence import history_digest
 
 
 class MarketDataAgent(BaseAgent):
@@ -28,10 +29,35 @@ class MarketDataAgent(BaseAgent):
         watchlist = state["watchlist"]
         logs.append(self.log("Fetching market data for {} symbols.", len(watchlist)))
 
+        portfolio_snapshot_valid = False
+        try:
+            portfolio_tracker.sync_from_broker()
+            portfolio_snapshot_valid = portfolio_tracker.update_unrealised_pnl()
+            if not portfolio_snapshot_valid:
+                errors.append(self.log("Fresh marks unavailable for one or more open positions."))
+        except Exception as exc:
+            errors.append(self.log("Portfolio sync error: {}", exc))
+
         # ----- Historical OHLCV -----
         market_data = {}
+        market_data_provenance = {}
         try:
-            market_data = fetch_multiple(watchlist, interval="15m", days=30)
+            history_symbols = list(dict.fromkeys([*watchlist, *portfolio_tracker.positions]))
+            market_data = fetch_multiple(history_symbols, interval="15m", days=45)
+            for symbol, frame in market_data.items():
+                if not isinstance(frame, pd.DataFrame):
+                    errors.append(self.log("{}: Historical data is not a DataFrame.", symbol))
+                    continue
+                provenance = frame.attrs.get("history_provenance")
+                if not isinstance(provenance, dict):
+                    errors.append(self.log("{}: Historical data provenance is unavailable.", symbol))
+                    continue
+                market_data_provenance[symbol] = dict(provenance)
+                if not frame.empty:
+                    try:
+                        market_data_provenance[symbol]["bars_sha256"] = history_digest(frame)
+                    except (TypeError, ValueError, OverflowError) as exc:
+                        errors.append(self.log("{}: Historical data fingerprint failed: {}", symbol, type(exc).__name__))
             logs.append(self.log("Fetched historical data for {} symbols.", len(market_data)))
         except Exception as exc:
             err = self.log("Historical data fetch failed: {}", exc)
@@ -55,28 +81,26 @@ class MarketDataAgent(BaseAgent):
 
         # ----- India VIX -----
         india_vix = 0.0
+        india_vix_source = None
         try:
-            vix_data = fetch_index_data("99926004", interval="1d", days=5)  # India VIX token
-            if not vix_data.empty:
-                india_vix = float(vix_data.iloc[-1]["close"])
-            logs.append(self.log("India VIX: {:.2f}", india_vix))
+            india_vix, india_vix_source = fetch_india_vix()
+            if not math.isfinite(india_vix) or not 0 < india_vix <= 200:
+                raise ValueError("Invalid India VIX level; refusing an unrelated index value")
+            logs.append(self.log("India VIX: {:.2f} ({})", india_vix, india_vix_source))
         except Exception as exc:
-            logs.append(self.log("VIX fetch skipped: {}", exc))
-
-        # ----- Portfolio Sync -----
-        try:
-            portfolio_tracker.sync_from_broker()
-            portfolio_tracker.update_unrealised_pnl()
-        except Exception as exc:
-            errors.append(self.log("Portfolio sync error: {}", exc))
+            india_vix = 0.0
+            errors.append(self.log("India VIX unavailable: {}", type(exc).__name__))
 
         return {
             "market_data": market_data,
+            "market_data_provenance": market_data_provenance,
             "live_quotes": live_quotes,
             "india_vix": india_vix,
+            "india_vix_source": india_vix_source,
             "portfolio_value": portfolio_tracker.total_value,
             "available_capital": portfolio_tracker.available_capital,
             "current_positions": portfolio_tracker.positions,
+            "portfolio_snapshot_valid": portfolio_snapshot_valid,
             "agent_logs": logs,
             "errors": errors,
         }

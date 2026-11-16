@@ -71,6 +71,9 @@ class NiftyOptionsSeller:
         chain = fetch_options_chain(underlying, expiry_contains=expiry_contains)
         if chain.empty:
             return trades
+        if chain["ltp"].isna().all():
+            logger.warning("[{}] Option quote data is unavailable; research scan skipped.", self.name)
+            return trades
 
         # Find best OTM Call to sell
         ce_candidates = chain[

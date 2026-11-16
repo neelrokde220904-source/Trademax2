@@ -29,25 +29,47 @@ class OptionsAgent(BaseAgent):
         signals: dict[str, Any] = {}
 
         live_quotes = state.get("live_quotes", {})
+        captured = state.get("research_options_inputs", {})
+        replay = state.get("research_mode", False)
+        underlyings = ["NIFTY", "BANKNIFTY"]
+        if replay and any(
+            name not in captured or "chain" not in captured[name] or "spot" not in captured[name]
+            for name in underlyings
+        ):
+            raise ValueError("Missing captured options inputs for research replay")
+        inputs: dict[str, Any] = {}
 
-        for underlying in ["NIFTY", "BANKNIFTY"]:
+        for underlying in underlyings:
             try:
-                chain = fetch_options_chain(underlying)
+                chain = captured[underlying]["chain"] if replay else fetch_options_chain(underlying)
 
                 if chain.empty:
+                    inputs[underlying] = {"chain": chain, "spot": 0}
                     logs.append(self.log("{}: No options data available.", underlying))
                     continue
 
                 # PCR
                 pcr = calculate_pcr(chain)
+                if pcr is None:
+                    spot = captured[underlying]["spot"] if replay else live_quotes.get(underlying, {}).get("ltp", 0)
+                    inputs[underlying] = {"chain": chain, "spot": spot}
+                    signals[underlying] = {
+                        "signal": "HOLD", "confidence": 0, "data_status": "unavailable",
+                        "reasoning": "Valid single-expiry call and put open interest is unavailable.",
+                        "pcr": None, "max_pain": None, "support": None, "resistance": None,
+                        "unusual_oi_count": 0, "spot": spot,
+                    }
+                    logs.append(self.log("{}: OI data unavailable; options context abstains.", underlying))
+                    continue
 
                 # Get spot price
-                spot = live_quotes.get(underlying, {}).get("ltp", 0)
-                if not spot:
+                spot = captured[underlying]["spot"] if replay else live_quotes.get(underlying, {}).get("ltp", 0)
+                if not spot and not replay:
                     # Try to get from Nifty index token
                     spot_token = settings.nifty50_token if underlying == "NIFTY" else settings.banknifty_token
                     from broker.angel_client import angel_client
                     spot = angel_client.get_ltp("NSE", underlying, spot_token) or 0
+                inputs[underlying] = {"chain": chain, "spot": spot}
 
                 # Max pain
                 max_pain = calculate_max_pain(chain, spot) if spot else None
@@ -90,6 +112,7 @@ class OptionsAgent(BaseAgent):
                 signals[underlying] = {
                     "signal": signal,
                     "confidence": confidence,
+                    "data_status": "available",
                     "reasoning": " | ".join(reasoning_parts),
                     "pcr": pcr,
                     "max_pain": max_pain,
@@ -106,6 +129,7 @@ class OptionsAgent(BaseAgent):
 
         return {
             "options_signals": signals,
+            "research_options_inputs": inputs,
             "agent_logs": logs,
             "errors": errors,
         }
